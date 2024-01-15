@@ -327,9 +327,9 @@ for my $r ( sort { $a <=> $b } keys %partitions) {
   # New simpler format
   my $guid_seps=guid_proper($type_guid);
   print "Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
-  print "Name: $name, GUID: $guid_seps\n";
+  print " Name: $name, GUID: $guid_seps\n";
   if ($attr>0) {
-   print "Attributes bits set: ";
+   print " Attributes bits set: ";
     # loop through the bits of the attributes
     for my $j (0 .. 63) {
      # check if the bit is set
@@ -600,11 +600,11 @@ if ($backup_gpt_crc32 == crc32($backup_gpt_redone)) {
 
 # Find the maximal value for non emtpy partition to stop showing past that
 my $backup_partitions_max_nonempty;
-for my $r ( sort { $a <=> $b } keys %partitions) {
+for my $r ( sort { $a <=> $b } keys %backup_partitions) {
  # Cast to int
  my $c=$r+0;
  my $partition_entry;
- unless (defined($partitions{$c}{empty})) {
+ unless (defined($backup_partitions{$c}{empty})) {
   $backup_partitions_max_nonempty=$c;
  } # unless defined
 } # for
@@ -663,6 +663,23 @@ for my $r ( sort { $a <=> $b } keys %backup_partitions) {
   # New simpler format
   if ($divergent>0) {
    print "DIVERGENCE: BACKUP Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
+   print " Name: $name, GUID: $guid_seps\n";
+   if ($attr>0) {
+    print " Attributes bits set: ";
+     # loop through the bits of the attributes
+     for my $j (0 .. 63) {
+      # check if the bit is set
+      if ($attr & (1 << $j)) {
+       print "$j";
+       # give the meaning too
+       if (defined($gpt_attributes[$j])) {
+        print " ($gpt_attributes[$j])";
+       } # if text
+       print ",";
+      } # if
+     } # for
+     print "\n";
+   } # if attr
   }
  }
 }

@@ -4,28 +4,38 @@
 ## Check block device name and optional block size given as an argument for:
 # - MBR partitions (with potential ISO signatures)
 # - GPT partitions (checks the CRC32, and that backups are correct)
+# - *BUT* first check for headers, to correct the block size if forgotten
+
 use strict;
 use warnings;
 use Data::Dumper;  # Dirty debug
 use String::CRC32; # CRC32 calculations of the GPT headers and records
 
 ## Hardcoded
+# The default block size that'll be guessed from EFI headers if wrong
+my $hardcoded_default_block_size=512;
 # GPT size
 my $hardcoded_gpt_header_size=92;
-# default block size
-my $hardcoded_default_block_size=512;
+# MBR sizes
+my $hardcoded_mbr_bootcode_size=440;
+my $hardcoded_mbr_signature_size=6;
+my $hardcoded_mbr_bootsig=510;
+my $hardcoded_mbr_bootsig_size=2;
+my $hardcoded_mbr_size=64;
 
 ## Options
 # Justify the assignments of the types in the hashes
 my $justify=0;
-
 # Only print the partitions, nothing about the MBR or GPT headers
 my $noheaders=0;
-
+# And don't talk about the device size
+my $nodevinfo=0;
+# Or look for ISO signatures (while you really should...)
+my $noisodetect=0;
 # Look very carefully for ISO signatures in MBR partitions declared as "empty":
-my $debug=0;
+my $debug_isodetect=0;
 
-# Paraphrasing https://wiki.osdev.org/El-Torito#Hybrid_Setup_for_BIOS_and_EFI_from_CD.2FDVD_and_USB_stick:
+# https://wiki.osdev.org/El-Torito#Hybrid_Setup_for_BIOS_and_EFI_from_CD.2FDVD_and_USB_stick:
 # Several distributions offer a layout that does not comply to either of the UEFI alternatives.
 # The MBR marks the whole ISO by a partition of type 0x00.
 # Another MBR partition of type 0xef marks a data file inside the ISO 
@@ -40,7 +50,7 @@ my $debug=0;
 my @gpt_attributes;
 #cf https://superuser.com/questions/1771316/
 $gpt_attributes[0]="Platform required partition";
-$gpt_attributes[1]="EFO ignore the no block IO protocol";
+$gpt_attributes[1]="EFI please ignore this, no block IO protocol";
 $gpt_attributes[2]="Legacy BIOS bootable";
 #3-47 are reserved, cf https://en.wikipedia.org/wiki/GUID_Partition_Table?#Partition_entries_(LBA_2%E2%80%9333)
 $gpt_attributes[56]="Chromebook boot succes";
@@ -53,53 +63,40 @@ $gpt_attributes[50]="Chromebook 16-bits priority value bit 2";
 $gpt_attributes[49]="Chromebook 16-bits priority value bit 3";
 $gpt_attributes[48]="Chromebook 16-bits priority value bit 4";
 #cf https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/gpt
-$gpt_attributes[60]="Read-only";
-$gpt_attributes[61]="Shadow copy";
-$gpt_attributes[62]="Hidden";
-$gpt_attributes[63]="No automount";
-# in general, nick ef00: bit 0+1, nick 0700: bit 60+62+63
+$gpt_attributes[60]="Windows Read-only";
+$gpt_attributes[61]="Windows Shadow copy";
+$gpt_attributes[62]="Windows Hidden";
+$gpt_attributes[63]="Windows No automount";
+# In general, nick ef00: bit 0+1, nick 0700: bit 60+62+63
 # on windows: nick 0c01: bit 0,   nick 2700: bit 0+62
 
-my $device = shift @ARGV or die "Usage: $0 <block device> [<blocksize>]\n";
-my $bsize;
-unless ($bsize=shift @ARGV) {
- # Assign a default value to the second argument
- $bsize=$hardcoded_default_block_size;
+## GPT GUID: recode
+# The first field is 8 bytes long and is big-endian,
+# the second and third fields are 2 and 4 bytes long and are big-endian,
+# but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
+sub guid_proper {
+ my $input=shift;
+ my ($guid1, $guid2, $guid3, $guid4, $guid5) = unpack "H8 H4 H4 H4 H12", $input;
+ # reverse the endianness of the first 3 fields
+ my $guid1_le=unpack ("V", pack ("H8", $guid1));
+ my $guid2_le=unpack ("v", pack ("H4", $guid2));
+ my $guid3_le=unpack ("v", pack ("H4", $guid3));
+ my $output=sprintf ("%08x-%04x-%04x-%s-%s", $guid1_le, $guid2_le, $guid3_le, $guid4, $guid5);
+ # use upper case for the returns
+ return (uc($output));
 }
 
-print "# DEVICE\n";
-print "Checking $device with a LBA block size $bsize\n";
-print "(block size irrelevant for the MBR at LBA0, but important for GPT at LBA1)\n";
-# Open the block device for reading in binary mode
-open my $fh, "<:raw", $device or die "Can't open $device: $!\n";
-
-# Estimate the size
-seek $fh, -1, 2 or die "Can't seek to the end: $!\n";
-my $offset_end=tell $fh;
-my $device_size_G=$offset_end/(1024**3);
-my $lba=$offset_end/$bsize;
-my $lba_int=int($lba);
-printf "Size %.2f G, rounds to $lba_int LBA blocks for $lba\n", $device_size_G;
-# Check if goes beyond the end of a few usual LBA-bit MBR space:
-# 22 bit (original IDE), 28 bit (ATA-1 from 1994), 48 bit (ATA-6 from 2003)
-for my $i (28, 32, 48) {
- if ($offset_end > (2**$i) ) {
-  # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
-  print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
- }
-} # for
-
-# make a few hashes:
+# Make a few hashes:
 #  - for description and conversion
 my %guid_to_nick;
 my %nick_to_guid;
 # - for verbose description
 my %guid_to_text;
 my %nick_to_text;
-# in case the mbr and gpt description differs
+# - in case the mbr and gpt description differs
 my %nick_to_mbrtext;
 
-# ugly af but I wanted to reuse the existing definitions with minimal changes
+# Ugly af but I wanted to reuse the existing definitions with minimal changes
 sub add_type {
  my $nick = shift;
  my $guid = shift;
@@ -196,8 +193,8 @@ sub add_type {
  $nick_to_mbrtext{$nick}=$mbr_text;
 }
 
-# exhaustive table of facts matching more or less gptdisk format by Rod Smith:
-# the nick type is the MBR type *100, which is shorter to type that a GUID
+# Exhaustive table of facts matching more or less gptdisk format by Rod Smith:
+# The nick type is the MBR type *100, which is shorter to type that a GUID
 # there are not so many well-known GUID, so nicks are easier to show
 #cf https://www.rodsbooks.com/gdisk/download.html
 #  Nick type, GUID, GPT description, bool if should be shown for creation, MBR description.
@@ -560,6 +557,8 @@ add_type("fc00", "9D275380-40AD-11DB-BF97-000C2911D1B8", "VMWare kcore crash pro
 # A straggler Linux partition type....
 add_type("fd00", "A19D880F-05FC-4D3B-A006-743F0F84911E", "Linux RAID");
 
+## Tests
+
 # Simple assertions:
 my $check_0700_nick= $guid_to_nick{"EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"};
 unless ($check_0700_nick=~m/0700/) {
@@ -594,26 +593,74 @@ unless ($check_ef00_text=~m/EFI system partition/) {
  die;
 }
 
-# Seek to 440 (near the MBR end at offset 446)
-seek $fh, 440, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
-my $mbrsigs;
+## Actual beginning
+my $device = shift @ARGV or die "Usage: $0 <block device> [<blocksize>]\n";
+my $bsize;
+unless ($bsize=shift @ARGV) {
+ # Assign a default value to the second argument
+ $bsize=$hardcoded_default_block_size;
+}
 
-read $fh, $mbrsigs, 6 or die "Can't read the MBR signatures in 6 bytes: $!\n";
+## Device information like size and LBA blocks
+if ($nodevinfo <1) {
+ print "# DEVICE:\n";
+}
+my %device;
+
+if ($nodevinfo <1) {
+ print "Checking $device with a LBA block size $bsize\n";
+ print "(block size irrelevant for the MBR at LBA0, but important for GPT at LBA1)\n";
+}
+
+# Open the block device for reading in binary mode
+open my $fh, "<:raw", $device or die "Can't open $device: $!\n";
+
+# Estimate the size
+seek $fh, -1, 2 or die "Can't seek to the end: $!\n";
+my $offset_end=tell $fh;
+$device{end}=$offset_end;
+my $device_size_G=$offset_end/(1024**3);
+my $lba=$offset_end/$bsize;
+$device{lba}=$lba;
+my $lba_int=int($lba);
+if ($nodevinfo <1) {
+ printf "Size %.2f G, rounds to $lba_int LBA blocks for $lba\n", $device_size_G;
+}
+# Check if goes beyond the end of a few usual LBA-bit MBR space:
+# 22 bit (original IDE), 28 bit (ATA-1 from 1994), 48 bit (ATA-6 from 2003)
+for my $i (28, 32, 48) {
+ if ($offset_end > (2**$i) ) {
+  # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
+  if ($nodevinfo <1) {
+   print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
+  } # if
+ } # if
+} # for my i
+
+## MBR
+if ($noheaders <1) {
+ print "\n# MBR HEADER:\n";
+}
+my %mbr_header;
+
+# Seek to 440 (near the MBR end at offset 446)
+seek $fh, $hardcoded_mbr_bootcode_size, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
+my $mbrsigs;
+read $fh, $mbrsigs, $hardcoded_mbr_signature_size or die "Can't read the MBR signatures: $!\n";
 # at 440 there are 4 bytes for the disk number (signature)
 # at 444 there should be 2 null bytes that have been historically reserved
 my ($disksig, $nullsig) = unpack 'H8a2', $mbrsigs;
 
 # Then check that at 510, there's the expected 2 bytes boot signature
 # (0x55aa in little endian)
-seek $fh, 510, 0 or die "Can't seek to MBR boot signature: $!\n";
+seek $fh, $hardcoded_mbr_bootsig, 0 or die "Can't seek to MBR boot signature: $!\n";
 my $bootsig;
-read $fh, $bootsig, 2 or die "Can't read MBR boot signature: $!\n";
+read $fh, $bootsig, $hardcoded_mbr_bootsig_size or die "Can't read MBR boot signature: $!\n";
 my $bootsig_le=unpack ("H4", $bootsig);
+my $disksig_le=unpack ("V", pack ("H8", $disksig));
 
-unless ($noheaders == 1) {
- # Show the MBR headers
- print "\nMBR HEADER:\n";
- my $disksig_le=unpack ("V", pack ("H8", $disksig));
+# Show the MBR headers
+if ($noheaders <1) {
  printf "Disk UUID: %08x\n", $disksig_le;
  if ($bootsig eq "\x55\xaa") {
   printf "Signature (valid): $bootsig_le\n";
@@ -625,22 +672,166 @@ unless ($noheaders == 1) {
  } else {
   printf "2 null bytes (WARNING: NOT NULL): $nullsig\n";
  }
+} # if noheader
+
+# Populate the mbr header hash
+$mbr_header{bootsig}=$bootsig_le;
+$mbr_header{disksig}=$disksig_le;
+$mbr_header{nullsig}=$nullsig;
+
+## GPT header before MBR partitions to correct bsize as needed for isodetect
+if ($noheaders <1) {
+ print "\n# GPT HEADER:\n";
+}
+my %gpt_main_header;
+
+# Seek to the GPT header location at LBA1 ie 1*(block size)
+seek $fh, $bsize, 0 or die "Can't seek to the MAIN GPT header: $!\n";
+
+# Read 92 bytes of GPT header
+my $gpt_header;
+read $fh, $gpt_header, $hardcoded_gpt_header_size or die "Can't read MAIN GPT header: $!\n";
+
+# Parse the GPT header into fields
+my ($signature,
+ $revision, $header_size, $header_crc32own, $reserved,
+ $current_lba, $other_lba, $first_lba, $final_lba, $guid,
+ $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own) = unpack "a8 L L L L Q Q Q Q a16 Q L L L",
+ $gpt_header;
+
+# Check the GPT signature and revision
+if ($signature eq "EFI PART") {
+ if ($noheaders <1) {
+  printf "Signature (valid): %s\n", $signature;
+ }
+} else {
+ if ($noheaders <1) {
+  printf "Signature (WARNING: INVALID): %s\n", $signature;
+ }
+ # This should NOT happen, so try again after changing bsize
+ if ($noheaders <1) {
+  print " Trying again after setting bsize=";
+ }
+ for my $try_bsize (512, 2048, 4096) {
+  $bsize=$try_bsize;
+  if ($noheaders <1) {
+   print "$bsize,";
+  }
+  seek $fh, $bsize, 0 or die "Can't seek to the MAIN GPT header: $!\n";
+  # Read 92 bytes of GPT header
+  read $fh, $gpt_header, $hardcoded_gpt_header_size or die "Can't read MAIN GPT header: $!\n";
+  # Reparse the GPT header into fields
+  ($signature,
+   $revision, $header_size, $header_crc32own, $reserved,
+   $current_lba, $other_lba, $first_lba, $final_lba, $guid,
+   $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own) = unpack "a8 L L L L Q Q Q Q a16 Q L L L",
+  $gpt_header;
+  if ($signature eq "EFI PART") {
+   if ($noheaders <1) {
+    printf " and this worked.\n";
+    printf "Signature (valid): %s\n", $signature;
+   }
+   # noheaders or not, if the wrong information was given, say something
+   printf "WARNING: Wrong bsize was given, should have been $bsize\n";
+   $lba=$offset_end/$bsize;
+   # Update the LBA
+   $device{lba}=$lba;
+   $lba_int=int($lba);
+   if ($nodevinfo <1) {
+    printf "Size %.2f G, rounds to $lba_int LBA blocks for $lba\n", $device_size_G;
+   }
+   # Check if goes beyond the end of a few usual LBA-bit MBR space:
+   # 22 bit (original IDE), 28 bit (ATA-1 from 1994), 48 bit (ATA-6 from 2003)
+   for my $i (28, 32, 48) {
+    if ($offset_end > (2**$i) ) {
+     # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
+     if ($nodevinfo <1) {
+      print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
+     }
+    } # if
+   } # for i
+  } # if signature 2nd attempt
+ } # for try_bsize
+} # else signature
+
+# Check the GPT signature and revision
+if ($noheaders <1) {
+ if ($revision == 0x00010000) {
+  printf "Revision: %08x\n", $revision;
+ } else {
+  printf "Revision (WARNING: UNKNOWN): %08x\n", $revision;
+ }
+ # Print the rest of the GPT header information
+ printf "Header size (hardcoded $hardcoded_gpt_header_size): %d\n", $header_size;
+} # if noheaders
+# Check if the CRC is correct by reproducing its calculation: field zeroed out
+#my $header_nocrc32 = substr ($header, 0, 16) . "\x00\x00\x00\x00" . substr ($header, 20);
+# But here, reassembles everything from the variables to facilitate tweaks
+my $header_nocrc32 = pack ("a8 L L L L Q Q Q Q a16 Q L L L",
+ $signature, $revision, $header_size, ord("\0"), $reserved,
+ $current_lba, $other_lba, $first_lba, $final_lba, $guid,
+ $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own);
+my $header_crc32check=crc32($header_nocrc32);
+if ($noheaders <1) {
+ if ($header_crc32check == $header_crc32own) {
+  printf "Header CRC32 (valid): %08x\n", $header_crc32own;
+ } else {
+  printf "Header CRC32 (WARNING: INVALID BECAUSED EXPECTED %08x", $header_crc32check;
+  printf "): %08x\n", $header_crc32own;
+ }
+ printf "Current header (main) LBA: %d\n", $current_lba;
+ printf "Other header (backup) LBA: %d\n", $other_lba;
+ printf "First LBA: %d\n", $first_lba;
+ printf "Final LBA: %d\n", $final_lba;
+ #printf "GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $guid;
+ # GUID: The first field is 8 bytes long and is big-endian, the second and third fields are 2 and 4 bytes long and are big-endian,
+ # but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
+ printf "Disk GUID: %s\n", guid_proper($guid);
+ printf "GPT current (main) LBA: %d\n", $gptparts_lba;
+ printf "Number of partitions: %d\n", $num_parts;
+ printf "Partition record size: %d\n", $part_size;
+ printf "Partitions CRC32 (validity unknown yet):  %08x\n", $gptparts_crc32own;
+}
+# Populate the gpt main header hash
+$gpt_main_header{signature}=$signature;
+$gpt_main_header{revision}=$revision;
+$gpt_main_header{header_size}=$header_size;
+$gpt_main_header{header_crc32own}=$header_crc32own;
+$gpt_main_header{reserved}=$reserved;
+$gpt_main_header{current_lba}=$current_lba;
+$gpt_main_header{other_lba}=$other_lba;
+$gpt_main_header{first_lba}=$first_lba;
+$gpt_main_header{final_lba}=$final_lba;
+$gpt_main_header{guid_as_stored}=$guid;
+$gpt_main_header{guid}=guid_proper($guid);
+$gpt_main_header{gptparts_lba}=$gptparts_lba;
+$gpt_main_header{num_parts}=$num_parts;
+$gpt_main_header{part_size}=$part_size;
+$gpt_main_header{gptparts_crc32own}=$gptparts_crc32own;
+if ($header_crc32check == $header_crc32own) {
+ $gpt_main_header{header_crc32}{valid}=1;
+} else {
+ $gpt_main_header{header_crc32}{valid}=0;
 }
 
-print "\nMBR PARTITIONS:\n";
+## Primary MBR partitions & iso signatures exploration
+if ($noheaders <1) {
+ print "\n# MBR PARTITIONS:\n";
+}
+my %mbr_partitions;
+# Keep track separately of what LBAs have been explored for CD001 signatures
+# (in case of partitions overlap)
+my %isosig_explored;
 
 # Seek back to the MBR location at offset 446
-seek $fh, 446, 0 or die "Can't seek to MBR: $!\n";
+seek $fh, $hardcoded_mbr_bootcode_size+$hardcoded_mbr_signature_size, 0 or die "Can't seek to MBR: $!\n";
 
 # Read 64 bytes of MBR partition table
 my $mbr;
-read $fh, $mbr, 64 or die "Can't read MBR: $!\n";
+read $fh, $mbr, $hardcoded_mbr_size or die "Can't read MBR: $!\n";
 
 # Parse the MBR partition table into four 16-byte entries
 my @partitions = unpack "(a16)4", $mbr;
-
-# Keep a track of what's been explored
-my %explored;
 
 # Loop through each MBR partition entry
 for my $i (0 .. 3) {
@@ -665,12 +856,20 @@ for my $i (0 .. 3) {
  my $nick = lc(sprintf("%02x",$type)) . "00";
 
  # Print the partition number, status, type, start sector, end sector, size, and number of sectors
- printf "Partition #%d: Start: %d, Stops: %d, Sectors: %d, Size: %d M\n", $i + 1, $start, $end, $sectors, $size;
-my $stat= sprintf ("%02x", $status);
-my $mbrtype= uc(sprintf ("%02x", $type));
+ printf "MBR Partition #%d: Start: %d, Stops: %d, Sectors: %d, Size: %d M\n", $i + 1, $start, $end, $sectors, $size;
+
+ # Populate the mbr partition hash
+ $mbr_partitions{$i}{status}=$status;
+ $mbr_partitions{$i}{type}=$type;
+ $mbr_partitions{$i}{nick}=$nick;
+ $mbr_partitions{$i}{start}=$start;
+ $mbr_partitions{$i}{sectors}=$sectors;
+
+ my $stat= sprintf ("%02x", $status);
+ my $mbrtype= uc(sprintf ("%02x", $type));
  print " Nick: $nick, Text: $nick_to_mbrtext{$nick}, MBR type: $mbrtype, Status: $stat\n";
  # if multiple partitions are defined to start at the same address, will only explore once
- if ($type == 0) {
+ if ($type == 0 and $noisodetect<1) {
   # look for ISO9660 signature: ASCII string CD001 and count how many there are
   # usually occurs at offset 32769 (0x8001), 34817 (0x8801), or 36865 (0x9001):
   #  32769 is the Primary Volume Descriptor (PVD) of an ISOFS:
@@ -694,15 +893,15 @@ my $mbrtype= uc(sprintf ("%02x", $type));
     # so add this vd_lba_start 
     my $lba=$begin + $vd_start;
     # don't explore again the same lba: check the hash
-    if ($debug>0) {
-     if (exists $explored{$lba}) {
-      print " (already shown its data at $lba in previous partition #$explored{$lba})\n";
+    if ($debug_isodetect>0) {
+     if (exists $isosig_explored{$lba}) {
+      print " (already shown its data at $lba in previous partition #$isosig_explored{$lba})\n";
      }
      print " - checking LBA $lba for volume descriptor start $vd_start at partition start $start\n";
     } # if debug
-    unless (defined $explored{$lba}) {
+    unless (defined $isosig_explored{$lba}) {
      # mark it as explored
-     $explored{$lba}=$i+1;
+     $isosig_explored{$lba}=$i+1;
      my $type=0;
      until ($type > 254) {
       my $offset=$lba*2048;
@@ -720,266 +919,265 @@ my $mbrtype= uc(sprintf ("%02x", $type));
       }
       $lba=$lba+1;
      } # until type
-    } # unless explored
+    } # unless isosig_explored
    } # for my vd_start
   } # for my begin
   if ($isosig_nbr>2) {
    print ("\tthus not type 00=empty but has an ISO9600 filesystem\n");
   }
+  # Save to the hash, regardless of the value
+  $mbr_partitions{$i}{isosig}=$isosig_nbr;
  } # if type 0
-}
+} # for my i
 
-# GUID: The first field is 8 bytes long and is big-endian, the second and third fields are 2 and 4 bytes long and are big-endian,
-# but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
-sub guid_proper {
- my $input=shift;
- my ($guid1, $guid2, $guid3, $guid4, $guid5) = unpack "H8 H4 H4 H4 H12", $input;
- # reverse the endianness of the first 3 fields
- my $guid1_le=unpack ("V", pack ("H8", $guid1));
- my $guid2_le=unpack ("v", pack ("H4", $guid2));
- my $guid3_le=unpack ("v", pack ("H4", $guid3));
- my $output=sprintf ("%08x-%04x-%04x-%s-%s", $guid1_le, $guid2_le, $guid3_le, $guid4, $guid5);
- # use upper case for the returns
- return (uc($output));
-}
+## Secondary GPT header
+my %gpt_backup_header;
+# should have $other_lba by the end of the disk:
+# LBA      Z-33: last usable sector
+# LBA       Z-2:  GPT partition table (backup)
+# LBA       Z-1:  GPT header (backup)
+# LBA         Z: end of disk
 
-# Seek to the GPT header location at LBA1 ie 1*(block size)
-seek $fh, $bsize, 0 or die "Can't seek to the MAIN GPT header: $!\n";
+# Use a negative number to go in the other direction, from the end
+seek $fh, -1*$bsize, 2 or die "Can't seek to BACKUP header at LBA-2: $!\n";
+# Then get the actual position
+my $other_offset = tell $fh;
+my $other_lba_offset=int($other_offset/$bsize);
 
-# Read 92 bytes of GPT header
-my $header;
-read $fh, $header, $hardcoded_gpt_header_size or die "Can't read MAIN GPT header: $!\n";
-
-# Parse the GPT header into fields
-my ($signature,
- $revision, $header_size, $header_crc32own, $reserved,
- $current_lba, $other_lba, $first_lba, $final_lba, $guid,
- $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own) = unpack "a8 L L L L Q Q Q Q a16 Q L L L",
- $header;
-
-unless ($noheaders==1) {
- print "\nGPT HEADER:\n";
-
- # Check the GPT signature and revision
- if ($signature eq "EFI PART") {
-  printf "Signature (valid): %s\n", $signature;
+# And check if it matches: then $other_lba is by the end of the disk
+if ($noheaders <1) {
+ print "\n";
+ if ($other_lba == $other_lba_offset) {
+  print "# BACKUP GPT header (valid offset for LBA-1 -> $other_offset): $other_lba\n";
  } else {
-  printf "Signature (WARNING: INVALID): %s\n", $signature;
-  # This should NOT happen, so try again after changing bsize
-  print " Trying again after setting bsize=";
-  for my $try_bsize (512, 2048, 4096) {
-   $bsize=$try_bsize;
-   print "$bsize,";
-   seek $fh, $bsize, 0 or die "Can't seek to the MAIN GPT header: $!\n";
-   # Read 92 bytes of GPT header
-   read $fh, $header, $hardcoded_gpt_header_size or die "Can't read MAIN GPT header: $!\n";
-   # Parse the GPT header into fields
-   ($signature,
-    $revision, $header_size, $header_crc32own, $reserved,
-    $current_lba, $other_lba, $first_lba, $final_lba, $guid,
-    $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own) = unpack "a8 L L L L Q Q Q Q a16 Q L L L",
-   $header;
-   if ($signature eq "EFI PART") {
-    printf " and this worked.\n";
-    printf "WARNING: Wrong bsize was given, should have been $bsize\n";
-    $lba=$offset_end/$bsize;
-    $lba_int=int($lba);
-    printf "Size %.2f G, rounds to $lba_int LBA blocks for $lba\n", $device_size_G;
-# Check if goes beyond the end of a few usual LBA-bit MBR space:
-# 22 bit (original IDE), 28 bit (ATA-1 from 1994), 48 bit (ATA-6 from 2003)
-    for my $i (28, 32, 48) {
-     if ($offset_end > (2**$i) ) {
-      # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
-      print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
-     } # if
-    } # for i
-   } # if signature 2nd attempt
-  } # for try_bsize
- } # else signature
- if ($revision == 0x00010000) {
-  printf "Revision: %08x\n", $revision;
- } else {
-  printf "Revision (WARNING: UNKNOWN): %08x\n", $revision;
+  print "# BACKUP GPT header (WARNING: INVALID OFFSET SINCE LBA-1 -> $other_lba_offset != $other_offset): $other_lba\n";
  }
- # Print the rest of the GPT header information
- printf "Header size (hardcoded $hardcoded_gpt_header_size): %d\n", $header_size;
-# Check if the CRC is correct by reproducing its calculation: field zeroed out
-#my $header_nocrc32 = substr ($header, 0, 16) . "\x00\x00\x00\x00" . substr ($header, 20);
-# But here, reassembles everything from the variables to facilitate tweaks
-my $header_nocrc32 = pack ("a8 L L L L Q Q Q Q a16 Q L L L",
+}
+# Yet store that possible discrepency in the hash
+$gpt_main_header{other_lba_expected}=$other_lba_offset;
+
+my $backup_header;
+read $fh, $backup_header, $hardcoded_gpt_header_size or die "Can't read backup GPT header: $!\n";
+
+# Parse the backup GPT header into fields
+my ($backup_signature, $backup_revision, $backup_header_size, $backup_header_crc32own, $backup_reserved,
+ $backup_current_lba, $backup_other_lba, $backup_first_lba, $backup_final_lba, $backup_guid,
+ $backup_gptparts_lba, $backup_num_parts, $backup_part_size, $backup_gptparts_crc32own) = unpack "a8 L L L L Q Q Q Q a16 Q L L L", $backup_header;
+
+# Check the GPT signature and revision
+# But don't die if the backup is wrong, as it could simply be missing
+#die "Unsupported GPT revision: $backup_revision\n" unless $backup_revision == 0x00010000;
+if ($noheaders <1) {
+ # Check the GPT signature and revision
+ if ($signature ne $backup_signature) {
+  if ($backup_signature eq "EFI PART") {
+   printf "DIVERGENCE: BACKUP Signature (valid): %s\n", $backup_signature;
+  } else {
+   printf "DIVERGENCE: BACKUP Signature (WARNING: INVALID): %s\n", $backup_signature;
+  }
+  if ($backup_revision == 0x00010000) {
+   printf "DIVERGENCE: BACKUP Revision: %08x\n", $backup_revision;
+  } else {
+   printf "DIVERGENCE: BACKUP Revision (WARNING: UNKNOWN): %08x\n", $backup_revision;
+  }
+  if ($header_size != $backup_header_size) {
+   print "DIVERGENCE: BACKUP Header size (hardcoded $hardcoded_gpt_header_size): $backup_header_size\n";
+  }
+ }
+}
+
+# Do a quick check if the CRC is ok: reproduce it with own field zeroed out
+my $backup_header_nocrc32 = substr ($backup_header, 0, 16) . "\x00\x00\x00\x00" . substr ($backup_header, 20);
+my $backup_header_crc32check=crc32($backup_header_nocrc32);
+if ($noheaders <1) {
+ if ($backup_header_crc32check == $backup_header_crc32own) { 
+  printf "BACKUP CRC32 (valid): %08x\n", $backup_header_crc32own;
+ } else {
+  printf "BACKUP CRC32 (WARNING: INVALID BECAUSED EXPECTED %08x", $backup_header_crc32check;
+  printf "): %08x\n", $backup_header_crc32own;
+ }
+}
+# Then prepare CRC32 if the backup was canonical or primary wasn't primary:
+# - as usual, remove own header crc32
+# - swap backup_current_lba and backup_other_lba
+# - swap gptparts_lba and backup_gptparts_lba
+# This allow divergence checks and shows helpful information (hexedit/tweaks)
+my $backup_header_nocrc32_if_canonical= pack ("a8 L L L L Q Q Q Q a16 Q L L L",
+ $backup_signature, $backup_revision, $backup_header_size, ord("\0"), $backup_reserved,
+ $backup_other_lba, $backup_current_lba, $backup_first_lba, $backup_final_lba, $backup_guid,
+ $gptparts_lba, $backup_num_parts, $backup_part_size, $backup_gptparts_crc32own);
+my $header_nocrc32_if_noncanonical = pack ("a8 L L L L Q Q Q Q a16 Q L L L",
  $signature, $revision, $header_size, ord("\0"), $reserved,
- $current_lba, $other_lba, $first_lba, $final_lba, $guid,
- $gptparts_lba, $num_parts, $part_size, $gptparts_crc32own);
-my $header_crc32check=crc32($header_nocrc32);
-if ($header_crc32check == $header_crc32own) {
- printf "Header CRC32 (valid): %08x\n", $header_crc32own;
+ $other_lba, $current_lba, $first_lba, $final_lba, $guid,
+ $backup_gptparts_lba, $num_parts, $part_size, $gptparts_crc32own);
+
+# Only show the differences
+if ($noheaders <1) {
+ if (crc32($backup_header_nocrc32_if_canonical) ne $header_crc32own) {
+  printf "DIVERGENCE: BACKUP CRC32 if BACKUP Canonical: %08x (if backup became main at main LBA)\n", crc32($backup_header_nocrc32_if_canonical);
+ }
+ if (crc32($header_nocrc32_if_noncanonical) ne $backup_header_crc32own) {
+  printf "DIVERGENCE: MAIN CRC2 if MAIN Non-Canonical: %08x (if main became backup at backup LBA)\n", crc32($header_nocrc32_if_noncanonical);
+ }
+ if ($backup_current_lba != $other_lba) {
+  printf "DIVERGENCE: BACKUP Current (backup) LBA: %d\n", $backup_current_lba;
+ }
+ if ($current_lba != $backup_other_lba) {
+  printf "DIVERGENCE: BACKUP Other (main) LBA: %d\n", $backup_other_lba;
+ }
+ if ($first_lba != $backup_first_lba) {
+  printf "DIVERGENCE: BACKUP First LBA: %d\n", $backup_first_lba;
+ }
+ if ($final_lba != $backup_final_lba) {
+  printf "DIVERGENCE: BACKUP Final LBA: %d\n", $backup_final_lba;
+ }
+  #printf "GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $backup_guid;
+  # GUID: The first field is 8 bytes long and is big-endian, the second and third fields are 2 and 4 bytes long and are big-endian,
+  # but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
+ if ($guid ne $backup_guid) {
+  printf "DIVERGENCE: BACKUP GUID: %s\n", guid_proper($backup_guid);
+ }
+ # gptparts_lba from main must diverge from backup_gptparts_lba
+ printf "BACKUP GPT current (backup) LBA: %d\n", $backup_gptparts_lba;
+ if ($num_parts != $backup_num_parts) {
+  printf "DIVERGENCE: BACKUP Number of partitions: %d\n", $backup_num_parts;
+ }
+ if ($part_size != $backup_part_size) {
+  printf "DIVERGENCE: BACKUP Partition size: %d\n", $backup_part_size;
+ }
+}
+
+# Now populate the gpt backup header hash
+$gpt_backup_header{signature}=$backup_signature;
+$gpt_backup_header{revision}=$backup_revision;
+$gpt_backup_header{header_size}=$backup_header_size;
+$gpt_backup_header{header_crc32own}=$backup_header_crc32own;
+$gpt_backup_header{reserved}=$backup_reserved;
+$gpt_backup_header{current_lba}=$backup_current_lba;
+$gpt_backup_header{other_lba}=$backup_other_lba;
+$gpt_backup_header{first_lba}=$backup_first_lba;
+$gpt_backup_header{final_lba}=$backup_final_lba;
+$gpt_backup_header{guid}=$backup_guid;
+$gpt_backup_header{gptparts_lba}=$backup_gptparts_lba;
+$gpt_backup_header{num_parts}=$backup_num_parts;
+$gpt_backup_header{part_size}=$backup_part_size;
+$gpt_backup_header{gptparts_crc32own}=$backup_gptparts_crc32own;
+if ($backup_header_crc32check == $backup_header_crc32own) {
+ $gpt_backup_header{header_crc32}{valid}=1;
 } else {
- printf "Header CRC32 (WARNING: INVALID BECAUSED EXPECTED %08x", $header_crc32check;
- printf "): %08x\n", $header_crc32own;
-}
- printf "Current header (main) LBA: %d\n", $current_lba;
- printf "Other header (backup) LBA: %d\n", $other_lba;
- printf "First LBA: %d\n", $first_lba;
- printf "Final LBA: %d\n", $final_lba;
- #printf "GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $guid;
- # GUID: The first field is 8 bytes long and is big-endian, the second and third fields are 2 and 4 bytes long and are big-endian,
- # but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
- printf "Disk GUID: %s\n", guid_proper($guid);
- printf "GPT current (main) LBA: %d\n", $gptparts_lba;
- printf "Number of partitions: %d\n", $num_parts;
- printf "Partition record size: %d\n", $part_size;
- printf "Partitions CRC32 (validity unknown yet):  %08x\n", $gptparts_crc32own;
+ $gpt_backup_header{header_crc32}{valid}=0;
 }
 
-## Primary GPT partitions
-print "\n";
-print "# MAIN GPT PARTITIONS:\n";
+# Having both gpt headers, can decide to replace one by the other
+# however, this requires knowing if it would work given the crc32 + swaps
+if (crc32($backup_header_nocrc32_if_canonical) ne $header_crc32own) {
+ $gpt_backup_header{header_crc32}{valid_as_main}=0;
+} else {
+ $gpt_backup_header{header_crc32}{valid_as_main}=1;
+}
+if (crc32($header_nocrc32_if_noncanonical) ne $backup_header_crc32own) {
+ $gpt_main_header{header_crc32}{valid_as_backup}=0;
+} else {
+ $gpt_main_header{header_crc32}{valid_as_backup}=1;
+}
+# The same will be done with the partitions after reading them
 
+## Main GPT partitions
+print "\n# MAIN GPT PARTITIONS:\n";
+my %gpt_main_partitions;
 
 # Go to the start LBA offset
 my $offset=$gptparts_lba*$bsize;
 seek $fh, $offset, 0 or die "Can't seek to the GPT lba $gptparts_lba: $!\n";
 
 # The GPT hould have several partitions of 128 bytes each, but nothing hardcoded
-my $gpt;
+my $gptparts;
 my $span=$num_parts*$part_size;
-read $fh, $gpt, $span or die "Can't read the GPT at $num_parts*$part_size: $!\n";
+read $fh, $gptparts, $span or die "Can't read the GPT at $num_parts*$part_size: $!\n";
 
-# Could crc32 what we just read, but unpacking/repacking facilitate tweaks
-#if ($gpt_crc32 == crc32($gpt)) {
-# printf "Partition CRC32 (valid): %08x\n", $gpt_crc32;
-#} else {
-# printf "Partition CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($gpt);
-# printf "): %08x\n", $gpt_crc32;
-#}
+# crc32 what we just read to inform the gpt main header hash of the validity
+if ($gptparts_crc32own == crc32($gptparts)) {
+ printf "Partition CRC32 (valid): %08x\n", $gptparts_crc32own;
+ $gpt_main_header{gptparts_crc32}{valid}=1;
+} else {
+ printf "Partition CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($gptparts);
+ printf "): %08x\n", $gptparts_crc32own;
+ $gpt_main_header{gptparts_crc32}{valid}=0;
+}
 
 # Read the gpt partitions records
-my @partitions_records=unpack "(a$part_size)$num_parts", $gpt;
+my @partitions_records=unpack "(a$part_size)$num_parts", $gptparts;
 
 # Then populate a partition hash by unpacking each partition entry
-# need to do the partition CRC, but doing a hash will help after for output
-my %partitions;
 my $i=0;
 my $partition_entry_empty="\x00" x $part_size;
 for my $partition_entry (@partitions_records) {
- # Unpack each partition entry into fields of the hash
+ # Unpack each partition entry into fields
  my ($type_guid, $part_guid, $first_lba, $final_lba, $attr, $name) = unpack "a16 a16 Q Q Q a*", $partition_entry;
  # Skip empty partitions?
  #next if $type_guid eq "\x00" x 16;
  # Don't skip empties as could have the 1st partition be the nth, n!=1
  # Instead, mark as empty
+ # Populate the gpt main partitions hash
  if ($partition_entry eq $partition_entry_empty) {
-  $partitions{$i}{empty}=1;
+  $gpt_main_partitions{$i}{empty}=1;
  } else {
-  # Populate the hash
-  $partitions{$i}{type_guid}=$type_guid;
-  $partitions{$i}{part_guid}=$part_guid;
-  $partitions{$i}{first_lba}=$first_lba;
-  $partitions{$i}{final_lba}=$final_lba;
-  $partitions{$i}{attr}=$attr;
-  $partitions{$i}{name}=$name;
+  $gpt_main_partitions{$i}{type_guid}=$type_guid;
+  $gpt_main_partitions{$i}{nick}=$type_guid;
+  $gpt_main_partitions{$i}{part_guid}=$part_guid;
+  $gpt_main_partitions{$i}{first_lba}=$first_lba;
+  $gpt_main_partitions{$i}{final_lba}=$final_lba;
+  $gpt_main_partitions{$i}{attr}=$attr;
+  # Strip null bytes from the name
+  $name=~tr/\0//d;
+  $gpt_main_partitions{$i}{name}=$name;
+  # Store the guid as it's expected
+  my $guid_seps=guid_proper($type_guid);
+  my $nick=$guid_to_nick{$guid_seps};
+  $gpt_main_partitions{$i}{guid}=$guid_seps;
+  # And the nick to facilitate MBR<->GPT operations
+  $gpt_main_partitions{$i}{nick}=$nick;
  }
  $i=$i+1;
 } # for @partitions_records
 
-# (then if partitions need to be tweaked, can be done here)
-
-# reconcatenate the records to redo the gpt
-my $gpt_redone;
-# but must sort the hash keys numerically (otherwise 0 1 10 100 101 ..)
-for my $r ( sort { $a <=> $b } keys %partitions) {
- # cast to int
- my $c=$r+0;
- my $partition_entry;
- if (defined($partitions{$c}{empty})) {
-  if ($partitions{$c}{empty}==1) {
-    $partition_entry=$partition_entry_empty;
-  }
- } else {
-  $partition_entry=pack 'a16 a16 Q Q Q a*', 
-   $partitions{$c}{type_guid},
-   $partitions{$c}{part_guid},
-   $partitions{$c}{first_lba},
-   $partitions{$c}{final_lba},
-   $partitions{$c}{attr},
-   $partitions{$c}{name};
- } # if not empty
- # pad by null bytes to the $part_size
- $partition_entry .= "\x00" x ($part_size - length $partition_entry);
- # then append to redo a gpt
- $gpt_redone .= $partition_entry;
-} # for my r
-
-# each is 128 bytes,
-if (0) {
- print "partition hash keys:\n";
- print Dumper(scalar(keys(%partitions)));
- print "first 4 entries:\n";
- print Dumper($partitions{0});
- print Dumper($partitions{1});
- print Dumper($partitions{2});
- print Dumper($partitions{3});
- print "reconstituted " . length($gpt_redone) . " bytes \n";
- print Dumper($gpt_redone);
- print "original " . length($gpt) . " bytes \n";
- print Dumper($gpt);
-}
-
-if ($gptparts_crc32own == crc32($gpt_redone)) {
- printf "Partitions CRC32 (valid): %08x\n", $gptparts_crc32own;
-} else {
- printf "Partitions CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($gpt);
- printf "): %08x\n", $gptparts_crc32own;
-
-# # could compare byte by byte
-# for my $i (0 .. length ($gpt) - 1) {
-#  my $byte1 = substr ($gpt, $i, 1);
-#  my $byte2 = substr ($gpt_redone, $i, 1);
-#
-#  if ($byte1 ne $byte2) {
-#   printf "Diff @ %d: %02x vs %02x\n", $i, ord ($byte1), ord ($byte2);
-#  }
-# }
-
-} # if match redone
-
-# Find the maximal value for non emtpy partition to stop showing past that
+# Find the maximal value for non empty partition to stop showing past that
 my $partitions_max_nonempty;
-for my $r ( sort { $a <=> $b } keys %partitions) {
+for my $r ( sort { $a <=> $b } keys %gpt_main_partitions) {
  # Cast to int
  my $c=$r+0;
  my $partition_entry;
- unless (defined($partitions{$c}{empty})) {
+ unless (defined($gpt_main_partitions{$c}{empty})) {
   $partitions_max_nonempty=$c;
  } # unless defined
 } # for
 
 # No need to loop through each partition entry: show from the hash
-for my $r ( sort { $a <=> $b } keys %partitions) {
+for my $r ( sort { $a <=> $b } keys %gpt_main_partitions) {
  # Cast to int
  my $c=$r+0;
  my $partition_entry;
- if (defined($partitions{$c}{empty})) {
-  if ($partitions{$c}{empty}==1) {
+ if (defined($gpt_main_partitions{$c}{empty})) {
+  if ($gpt_main_partitions{$c}{empty}==1) {
    if ($c <$partitions_max_nonempty) {
     print "Partition $c: (empty)\n";
    }
   }
  } else {
-  my $type_guid=$partitions{$c}{type_guid};
-  my $guid_seps=guid_proper($type_guid);
-  my $part_guid=$partitions{$c}{part_guid};
-  my $first_lba=$partitions{$c}{first_lba};
-  my $final_lba=$partitions{$c}{final_lba};
-  my $attr= $partitions{$c}{attr};
-  my $name=$partitions{$c}{name};
+  my $type_guid=$gpt_main_partitions{$c}{type_guid};
+  my $guid=$gpt_main_partitions{$c}{guid};
+  my $part_guid=$gpt_main_partitions{$c}{part_guid};
+  my $first_lba=$gpt_main_partitions{$c}{first_lba};
+  my $final_lba=$gpt_main_partitions{$c}{final_lba};
+  my $attr= $gpt_main_partitions{$c}{attr};
+  my $name=$gpt_main_partitions{$c}{name};
+  my $nick=$gpt_main_partitions{$c}{nick};
   # Print the partition number and information
   my $sectors=$final_lba - $first_lba + 1;
   my $size = int (($sectors * $bsize)/(1024*1024));
-  print "Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
+  print "GPT Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
   # Get the short nick from the guid, and likewise for the textual description
-  my $nick=$guid_to_nick{$guid_seps};
-  print " Nick: $nick, Text: $guid_to_text{$guid_seps}, Name: $name, GUID: $guid_seps\n";
+  print " Nick: $nick, Text: $guid_to_text{$guid}, Name: $name, GUID: $guid\n";
   if ($attr>0) {
    print " Attributes bits set: ";
    # loop through the bits of the attributes
@@ -999,111 +1197,7 @@ for my $r ( sort { $a <=> $b } keys %partitions) {
  } # else empty
 } # for
 
-## Secondary GPT header
-# should have $other_lba by the end of the disk:
-# LBA      Z-33: last usable sector
-# LBA       Z-2:  GPT partition table (backup)
-# LBA       Z-1:  GPT header (backup)
-# LBA         Z: end of disk
-print "\n";
-
-# Use a negative number to go in the other direction, from the end
-seek $fh, -1*$bsize, 2 or die "Can't seek to BACKUP header at LBA-2: $!\n";
-# Then get the actual position
-my $other_offset = tell $fh;
-my $other_lba_offset=int($other_offset/$bsize);
-
-# And check if it matches: then $other_lba is by the end of the disk
-if ($other_lba == $other_lba_offset) {
- print "# BACKUP GPT header (valid offset for LBA-1 -> $other_offset): $other_lba\n";
-} else {
- print "# BACKUP GPT header (WARNING: INVALID OFFSET SINCE LBA-1 -> $other_lba_offset != $other_offset): $other_lba\n";
-}
-
-my $backup_header;
-read $fh, $backup_header, $hardcoded_gpt_header_size or die "Can't read backup GPT header: $!\n";
-
-# Parse the backup GPT header into fields
-my ($backup_signature, $backup_revision, $backup_header_size, $backup_header_crc32own, $backup_reserved,
- $backup_current_lba, $backup_other_lba, $backup_first_lba, $backup_final_lba, $backup_guid,
- $backup_gptparts_lba, $backup_num_parts, $backup_part_size, $backup_gpt_crc32) = unpack "a8 L L L L Q Q Q Q a16 Q L L L", $backup_header;
-
-# Check the GPT signature and revision
-# But don't die if the backup is wrong, as it could simply be missing
-#die "Unsupported GPT revision: $backup_revision\n" unless $backup_revision == 0x00010000;
-# Check the GPT signature and revision
-if ($signature ne $backup_signature) {
- if ($backup_signature eq "EFI PART") {
-  printf "DIVERGENCE: BACKUP Signature (valid): %s\n", $backup_signature;
- } else {
-  printf "DIVERGENCE: BACKUP Signature (WARNING: INVALID): %s\n", $backup_signature;
- }
- if ($backup_revision == 0x00010000) {
-  printf "DIVERGENCE: BACKUP Revision: %08x\n", $backup_revision;
- } else {
-  printf "DIVERGENCE: BACKUP Revision (WARNING: UNKNOWN): %08x\n", $backup_revision;
- }
- if ($header_size != $backup_header_size) {
-  print "DIVERGENCE: BACKUP Header size (hardcoded $hardcoded_gpt_header_size): $backup_header_size\n";
- }
-}
-
-# Do a quick check if the CRC is ok: reproduce it with own field zeroed out
-my $backup_header_nocrc32 = substr ($backup_header, 0, 16) . "\x00\x00\x00\x00" . substr ($backup_header, 20);
-my $backup_header_crc32check=crc32($backup_header_nocrc32);
-if ($backup_header_crc32check == $backup_header_crc32own) { 
- printf "BACKUP CRC32 (valid): %08x\n", $backup_header_crc32own;
-} else {
- printf "BACKUP CRC32 (WARNING: INVALID BECAUSED EXPECTED %08x", $backup_header_crc32check;
- printf "): %08x\n", $backup_header_crc32own;
-}
-# Then prepare CRC32 if the backup was canonical or primary wasn't primary:
-# - as usual, remove own header crc32
-# - swap backup_current_lba and backup_other_lba
-# - swap gptparts_lba and backup_gptparts_lba
-# This allow divergence checks and shows helpful information (hexedit/tweaks)
-my $backup_header_nocrc32_if_canonical= pack ("a8 L L L L Q Q Q Q a16 Q L L L",
- $backup_signature, $backup_revision, $backup_header_size, ord("\0"), $backup_reserved,
- $backup_other_lba, $backup_current_lba, $backup_first_lba, $backup_final_lba, $backup_guid,
- $gptparts_lba, $backup_num_parts, $backup_part_size, $backup_gpt_crc32);
-my $header_nocrc32_if_noncanonical = pack ("a8 L L L L Q Q Q Q a16 Q L L L",
- $signature, $revision, $header_size, ord("\0"), $reserved,
- $other_lba, $current_lba, $first_lba, $final_lba, $guid,
- $backup_gptparts_lba, $num_parts, $part_size, $gptparts_crc32own);
-
-# Only show the differences
-if (crc32($backup_header_nocrc32_if_canonical) ne $header_crc32own) {
- printf "DIVERGENCE: BACKUP CRC32 if BACKUP Canonical: %08x (if backup became main at main LBA)\n", crc32($backup_header_nocrc32_if_canonical);
-}
-if (crc32($header_nocrc32_if_noncanonical) ne $backup_header_crc32own) {
- printf "DIVERGENCE: MAIN CRC2 if MAIN Non-Canonical: %08x (if main became backup at backup LBA)\n", crc32($header_nocrc32_if_noncanonical);
-}
-if ($backup_current_lba != $other_lba) {
- printf "DIVERGENCE: BACKUP Current (backup) LBA: %d\n", $backup_current_lba;
-}
-if ($current_lba != $backup_other_lba) {
- printf "DIVERGENCE: BACKUP Other (main) LBA: %d\n", $backup_other_lba;
-}
-if ($first_lba != $backup_first_lba) {
- printf "DIVERGENCE: BACKUP First LBA: %d\n", $backup_first_lba;
-}
-if ($final_lba != $backup_final_lba) {
- printf "DIVERGENCE: BACKUP Final LBA: %d\n", $backup_final_lba;
-}
- #printf "GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $backup_guid;
- # GUID: The first field is 8 bytes long and is big-endian, the second and third fields are 2 and 4 bytes long and are big-endian,
- # but the fourth and fifth fields are 4 and 12 bytes long and are little-endian
-if ($guid ne $backup_guid) {
- printf "DIVERGENCE: BACKUP GUID: %s\n", guid_proper($backup_guid);
-}
-# gptparts_lba from main must diverge from backup_gptparts_lba
-printf "BACKUP GPT current (backup) LBA: %d\n", $backup_gptparts_lba;
-if ($num_parts != $backup_num_parts) {
- printf "DIVERGENCE: BACKUP Number of partitions: %d\n", $backup_num_parts;
-}
-if ($part_size != $backup_part_size) {
- printf "DIVERGENCE: BACKUP Partition size: %d\n", $backup_part_size;
-}
+# FIXME}
 
 ## Backup GPT partitions
 print "\n";
@@ -1117,34 +1211,41 @@ my $gptbackup_lba_offset=int($gptbackup_offset/$bsize);
 
 # And check if it matches: then $other_lba is by the end of the disk
 if ($backup_gptparts_lba == $gptbackup_lba_offset) {
- print "# BACKUP GPT AT (valid offset for LBA-2 -> $gptbackup_offset): $backup_gptparts_lba\n";
+ print "BACKUP GPT AT (valid offset for LBA-2 -> $gptbackup_offset): $backup_gptparts_lba\n";
 } else {
- print "# BACKUP GPT AT (WARNING: UNEXPECTED AT $gptbackup_offset SINCE LBA-2 -> $gptbackup_lba_offset): $backup_gptparts_lba\n";
+ print "BACKUP GPT AT (WARNING: UNEXPECTED AT $gptbackup_offset SINCE LBA-2 -> $gptbackup_lba_offset): $backup_gptparts_lba\n";
 }
+# Yet store that possible discrepency in the hash
+$gpt_backup_header{expected_current_lba}=$gptbackup_lba_offset;
 
 # Go to the start LBA offset
 my $backup_offset=$backup_gptparts_lba*$bsize;
 seek $fh, $backup_offset, 0 or die "Can't seek to the BACKUP GPT lba $backup_gptparts_lba: $!\n";
 
 # The GPT hould have several partitions of 128 bytes each, but nothing hardcoded
-my $backup_gpt;
+my $backup_gptparts;
 my $backup_span=$num_parts*$part_size;
-read $fh, $backup_gpt, $span or die "Can't read the BACKUP GPT at $backup_num_parts*$backup_part_size: $!\n";
+read $fh, $backup_gptparts, $span or die "Can't read the BACKUP GPT at $backup_num_parts*$backup_part_size: $!\n";
 
-# Could crc32 what we just read, but unpacking/repacking facilitate tweaks
-#if ($backup_gpt_crc32 == crc32($backup_gpt)) {
-# printf "BACKUP Partition CRC32 (valid): %08x\n", $gpt_crc32;
-#} else {
-# printf "BACKUP Partition CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($backup_gpt);
-# printf "): %08x\n", $backup_gpt_crc32;
-#}
+# We're now done with the reading
+close $fh or die "Can't close $device: $!\n";
+
+# Crc32 what we just read, to update the backup header crc32 validity
+if ($backup_gptparts_crc32own == crc32($backup_gptparts)) {
+ printf "BACKUP Partition CRC32 (valid): %08x\n", $gptparts_crc32own;
+ $gpt_backup_header{gptparts_crc32}{valid}=1;
+} else {
+ printf "BACKUP Partition CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($backup_gptparts);
+ printf "): %08x\n", $backup_gptparts_crc32own;
+ $gpt_backup_header{gptparts_crc32}{valid}=0;
+}
 
 # Read the gpt partitions records
-my @backup_partitions_records=unpack "(a$backup_part_size)$backup_num_parts", $backup_gpt;
+my @backup_partitions_records=unpack "(a$backup_part_size)$backup_num_parts", $backup_gptparts;
 
 # Then populate a partition hash by unpacking each partition entry
 # need to do the partition CRC, but doing a hash will help after for output
-my %backup_partitions;
+my %gpt_backup_partitions;
 my $j=0;
 for my $partition_entry (@backup_partitions_records) {
  # Unpack each partition entry into fields of the hash
@@ -1153,141 +1254,85 @@ for my $partition_entry (@backup_partitions_records) {
  #next if $type_guid eq "\x00" x 16;
  # Don't skip empties as could have the 1st partition be the nth, n!=1
  # Instead, mark as empty
+ # Populate the hash
  if ($partition_entry eq $partition_entry_empty) {
-  $backup_partitions{$j}{empty}=1;
+  $gpt_backup_partitions{$j}{empty}=1;
  } else {
-  if (0) {
-   print "BACKUP Partition $j:\n";
-#   printf "Type GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $type_guid;
-   printf "BACKUP Type GUID: %s\n", guid_proper($type_guid);
-#   printf "Partition GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $part_guid;
-   printf "BACKUP Partition GUID: %s\n", guid_proper($part_guid);
-   printf "BACKUP First LBA: %d\n", $first_lba;
-   printf "BACKUP Final LBA: %d\n", $final_lba;
-   printf "BACKUP Size: %d\n", $final_lba - $first_lba + 1;
-   printf "BACKUP Sectors: %d\n", $final_lba - $first_lba + 1;
-   printf "BACKUP Attributes: %016x\n", $attr;
-   printf "BACKUP Name: %s\n", $name;
-  }
-  # Populate the hash
-  $backup_partitions{$j}{type_guid}=$type_guid;
-  $backup_partitions{$j}{part_guid}=$part_guid;
-  $backup_partitions{$j}{first_lba}=$first_lba;
-  $backup_partitions{$j}{final_lba}=$final_lba;
-  $backup_partitions{$j}{attr}=$attr;
-  $backup_partitions{$j}{name}=$name;
+  $gpt_backup_partitions{$j}{type_guid}=$type_guid;
+  $gpt_backup_partitions{$j}{part_guid}=$part_guid;
+  $gpt_backup_partitions{$j}{first_lba}=$first_lba;
+  $gpt_backup_partitions{$j}{final_lba}=$final_lba;
+  $gpt_backup_partitions{$j}{attr}=$attr;
+  # Strip null bytes from the name
+  $name=~tr/\0//d;
+  $gpt_backup_partitions{$j}{name}=$name;
+  # Store the guid as it's expected
+  my $guid_seps=guid_proper($type_guid);
+  my $nick=$guid_to_nick{$guid_seps};
+  $gpt_backup_partitions{$j}{guid}=$guid_seps;
+  # And the nick to facilitate MBR<->GPT operations
+  $gpt_backup_partitions{$j}{nick}=$nick;
  }
  $j=$j+1;
 } # for @partitions_records
 
-# (then if partitions need to be tweaked, can be done here)
-
-# reconcatenate the records to redo the gpt
-my $backup_gpt_redone;
-# but must sort the hash keys numerically (otherwise 0 1 10 100 101 ..)
-for my $r ( sort { $a <=> $b } keys %backup_partitions) {
- # cast to int
- my $c=$r+0;
- my $partition_entry;
- if (defined($backup_partitions{$c}{empty})) {
-  if ($backup_partitions{$c}{empty}==1) {
-   $partition_entry=$partition_entry_empty;
-  }
- } else {
-  $partition_entry=pack 'a16 a16 Q Q Q a*', 
-   $backup_partitions{$c}{type_guid},
-   $backup_partitions{$c}{part_guid},
-   $backup_partitions{$c}{first_lba},
-   $backup_partitions{$c}{final_lba},
-   $backup_partitions{$c}{attr},
-   $backup_partitions{$c}{name};
- } # if not empty
- # pad by null bytes to the $part_size
- $partition_entry .= "\x00" x ($backup_part_size - length $partition_entry);
- # then append to redo a gpt
- $backup_gpt_redone .= $partition_entry;
-} # for my r
-
-# each is 128 bytes,
-if (0) {
- print "BACKUP partition hash keys:\n";
- print Dumper(scalar(keys(%backup_partitions)));
- print "first 4 entries:\n";
- print Dumper($backup_partitions{0});
- print Dumper($backup_partitions{1});
- print Dumper($backup_partitions{2});
- print Dumper($backup_partitions{3});
- print "reconstituted " . length($backup_gpt_redone) . " bytes \n";
- print Dumper($backup_gpt_redone);
- print "original " . length($backup_gpt) . " bytes \n";
- print Dumper($backup_gpt);
-}
-
-if ($backup_gpt_crc32 == crc32($backup_gpt_redone)) {
- printf "BACKUP Partition CRC32 (valid): %08x\n", $backup_gpt_crc32;
-} else {
- printf "BACKUP Partition CRC32: (WARNING: INVALID, EXPECTED %08x", crc32($backup_gpt);
- printf "): %08x\n", $backup_gpt_crc32;
-
-# # could compare byte by byte
-# for my $i (0 .. length ($gpt) - 1) {
-#  my $byte1 = substr ($gpt, $i, 1);
-#  my $byte2 = substr ($gpt_redone, $i, 1);
-#
-#  if ($byte1 ne $byte2) {
-#   printf "Diff @ %d: %02x vs %02x\n", $i, ord ($byte1), ord ($byte2);
-#  }
-# }
-
-} # if match redone
-
-# Find the maximal value for non emtpy partition to stop showing past that
+# Find the maximal value for non empty partition to stop showing past that
 my $backup_partitions_max_nonempty;
-for my $r ( sort { $a <=> $b } keys %partitions) {
+for my $r ( sort { $a <=> $b } keys %gpt_backup_partitions) {
  # Cast to int
  my $c=$r+0;
  my $partition_entry;
- unless (defined($partitions{$c}{empty})) {
+ unless (defined($gpt_backup_partitions{$c}{empty})) {
   $backup_partitions_max_nonempty=$c;
  } # unless defined
 } # for
 
+# Count the divergences checked to tell if everything is normal
+my $divergences_checked=0;
+my $diverged_even_once=0;
+
 # No need to loop through each partition entry: show from the hash
-for my $r ( sort { $a <=> $b } keys %backup_partitions) {
+for my $r ( sort { $a <=> $b } keys %gpt_backup_partitions) {
  # Cast to int
  my $c=$r+0;
  my $partition_entry;
- if (defined($backup_partitions{$c}{empty})) {
+ if (defined($gpt_backup_partitions{$c}{empty})) {
   # but what if not in main?
-  unless (defined($partitions{$c}{empty})) {
+  unless (defined($gpt_main_partitions{$c}{empty})) {
      print "DIVERGENCE: BACKUP Partition $c: (empty) while MAIN is NOT empty\n";
   }
-  if ($backup_partitions{$c}{empty}==1) {
+  if ($gpt_backup_partitions{$c}{empty}==1) {
    if ($c < $backup_partitions_max_nonempty) {
     # only show if there's a difference somewhere:
-    if ($backup_partitions{$c}{empty} != $partitions{$c}{empty}) {
+    if ($gpt_backup_partitions{$c}{empty} != $gpt_main_partitions{$c}{empty}) {
      print "DIVERGENCE: BACKUP Partition $c: (empty)\n";
     }
    }
   }
  } else {
-  my $type_guid=$backup_partitions{$c}{type_guid};
-  my $part_guid=$backup_partitions{$c}{part_guid};
-  my $first_lba=$backup_partitions{$c}{first_lba};
-  my $final_lba=$backup_partitions{$c}{final_lba};
-  my $attr= $backup_partitions{$c}{attr};
-  my $name=$backup_partitions{$c}{name};
+  my $type_guid=$gpt_backup_partitions{$c}{type_guid};
+  my $guid=$gpt_backup_partitions{$c}{guid};
+  my $nick=$gpt_backup_partitions{$c}{nick};
+  my $part_guid=$gpt_backup_partitions{$c}{part_guid};
+  my $first_lba=$gpt_backup_partitions{$c}{first_lba};
+  my $final_lba=$gpt_backup_partitions{$c}{final_lba};
+  my $attr=$gpt_backup_partitions{$c}{attr};
+  my $name=$gpt_backup_partitions{$c}{name};
   my $divergent=0;
+
   # Detect differences to only show the different entries
-  if ($partitions{$c}{type_guid} ne $type_guid
-   or $partitions{$c}{part_guid} ne $part_guid
-   or $partitions{$c}{first_lba} ne $first_lba
-   or $partitions{$c}{final_lba} ne $final_lba
-   or $partitions{$c}{attr} ne $attr
-   or $partitions{$c}{name} ne $name) {
+  if ($gpt_main_partitions{$c}{type_guid} ne $type_guid
+   or $gpt_main_partitions{$c}{part_guid} ne $part_guid
+   or $gpt_main_partitions{$c}{first_lba} ne $first_lba
+   or $gpt_main_partitions{$c}{final_lba} ne $final_lba
+   or $gpt_main_partitions{$c}{attr} ne $attr
+   or $gpt_main_partitions{$c}{name} ne $name) {
     $divergent=1;
+    $diverged_even_once=1;
   }
-  
+  # But at least we checked!
+  $divergences_checked=$divergences_checked+1;
+
   # Print the partition number and information
   my $sectors=$backup_final_lba - $backup_first_lba + 1;
   my $size = int (($sectors * $bsize)/(1024*1024));
@@ -1305,10 +1350,30 @@ for my $r ( sort { $a <=> $b } keys %backup_partitions) {
   #printf "BACKUP Name: %s\n", $name;
   # New simpler format
   if ($divergent>0) {
-   print "DIVERGENCE: BACKUP Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
-  }
- }
+   print "DIVERGENCE: BACKUP GPT Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
+   # Show the details
+   print " Nick: $nick, Text: $guid_to_text{$guid}, Name: $name, GUID: $guid\n";
+   if ($attr>0) {
+    print " Attributes bits set: ";
+    # loop through the bits of the attributes
+    for my $j (0 .. 63) {
+     # check if the bit is set
+     if ($attr & (1 << $j)) {
+      print "$j";
+      # give the meaning too
+      if (defined($gpt_attributes[$j])) {
+       print " ($gpt_attributes[$j])";
+      } # if text
+      print ", ";
+     } # if bit
+    } # for
+    print "\n";
+   } # if attr
+  } # if divergent
+ } # else emptpy
+} # for my r
+
+if ($diverged_even_once==0) {
+ print "BACKUP GPT PARTITIONS: Strictly identical, checked for divergence $divergences_checked times (once for each known GPT partition)\n"
 }
 
-# Close the block device as we're done then
-close $fh or die "Can't close $device: $!\n";
