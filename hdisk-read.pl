@@ -45,6 +45,32 @@ my $debug_isodetect=0;
 # The nesting is made acceptable by giving the outer MBR partition the type 0x00
 # UEFI specifies to ignore MBR partitions 0x00"
 
+## CHS decoding
+sub hcs_to_chs {
+ my $bin=shift;
+ # c and h are 0-based, s is 1-based
+ # for (h,c,s)=(1023, 255, 63) as bytes
+ #     <FE>,   <FF>   ,<FF>
+ # head    ,  sector  ,  cylinder
+ # 11111110,  11111111,  11111111
+ #            xx <- cut away the first 2 bytes
+ #         ,  111111  ,xx11111111 <- add them to cylinder
+ #cf https://thestarman.pcministry.com/asm/mbr/PartTables.htm
+ my ($x1, $x2, $x3) = unpack("CCC", $bin);
+
+ # byte 1: h bits 7,6,5,4,3,2,1,0
+ # h value stored in the upper 6 bits of the first byte?
+ #my $h = $c2 >> 2;
+ my $h = $x1;
+
+ # byte 2: c bits 9,8 then s bits 5,4,3,2,1
+ # ie c value stored in the lower 10 bits of the last two bytes
+ my $c = (($x2 & 0b11) << 8) | $x3;
+ # s value stored in the lower 6 bits of the second byte
+ my $s = $x2 & 0b00111111;
+ return ($c, $h, $s);
+}
+
 ## GPT attributes bits
 # GPT partitions binary attributes
 my @gpt_attributes;
@@ -224,10 +250,8 @@ add_type("1700", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Microsoft basic data",
 add_type("1b00", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Microsoft basic data", 0,"Hidden FAT-32");
 add_type("1c00", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Microsoft basic data", 0,"Hidden FAT-32 LBA");
 add_type("1e00", "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7", "Microsoft basic data", 0,"Hidden FAT-16 LBA");
-# used only for bios:
-add_type("2700", "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC", "Windows RE", 0, "Windows RE (MBR GUID)");
-# specific guid for uefi, so make it win:
-add_type("2700", "EAC9A8D5-F78A-48B2-B2AA-B389EB160717", "Windows RE", 1, "Windows RE (GPT GUID)");
+# WARNING: previously listed 2700 nick wrong with C9A8D5-F78A-48B2-B2AA-B389EB160717
+add_type("2700", "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC", "Windows RE");
 
 # Open Network Install Environment (ONIE) specific types.
 # See http:#www.onie.org/ and
@@ -559,7 +583,23 @@ add_type("fd00", "A19D880F-05FC-4D3B-A006-743F0F84911E", "Linux RAID");
 
 ## Tests
 
-# Simple assertions:
+# Simple assertion to be able to detect LBA / non LBA
+# LBA is indicated by setting the max values ie 1023, 254, 63:
+# stands for the 1024th cylinder, 255th head and 63rd sector
+# because cylinder and head counts begin at zero.
+# on disk as three bytes: FE FF FF in that order because little endian
+# 111111101111111111111111 ie <FE><FF><FF> for (c,h,s)=(1023, 255, 63)
+# show that as a hex string and with packing
+for my $bin ("\xFE\xFF\xFF", pack("H*", "FEFFFF")) {
+ my ($c_lba, $h_lba, $s_lba)=hcs_to_chs($bin);
+ unless ($c_lba==1023 and $h_lba==254 and $s_lba==63) {
+  print "LBA detection assertion failed with $bin";
+  print "<FE><FF><FF> little endian does not give c,h,s=1023,254,63\n";
+  die;
+ } # unless
+} # for
+
+# Simple assertions to check the hashes are correctly assembled:
 my $check_0700_nick= $guid_to_nick{"EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"};
 unless ($check_0700_nick=~m/0700/) {
  print "Failed assertion: GUID EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 should be MBR type 07 therefore nick 0700\n";
@@ -570,13 +610,6 @@ my $check_0700_text= $guid_to_text{"EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"};
 unless ($check_0700_text=~m/Microsoft basic data/) {
  print "Failed assertion: GUID EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 should be 'Microsoft basic data'\n";
  print "Instead, is $check_0700_text\n";
- die;
-}
-
-my $check_2700_nick= $guid_to_nick{"EAC9A8D5-F78A-48B2-B2AA-B389EB160717"};
-unless ($check_2700_nick=~m/2700/) {
- print "Failed assertion: GUID EAC9A8D5-F78A-48B2-B2AA-B389EB160717 should be MBR type 27 therefore nick 2700\n";
- print "Instead, is $check_2700_nick\n";
  die;
 }
 
@@ -642,6 +675,12 @@ if ($noheaders <1) {
  print "\n# MBR HEADER:\n";
 }
 my %mbr_header;
+
+my $mbrbootcode;
+read $fh, $mbrbootcode, $hardcoded_mbr_bootcode_size, 0;
+if ($mbrbootcode=~ m/^\0*$/) {
+ print "Note: MBR bootcode empty, must be a GPT system\n";
+}
 
 # Seek to 440 (near the MBR end at offset 446)
 seek $fh, $hardcoded_mbr_bootcode_size, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
@@ -710,7 +749,7 @@ if ($signature eq "EFI PART") {
  }
  # This should NOT happen, so try again after changing bsize
  if ($noheaders <1) {
-  print " Trying again after setting bsize=";
+  print "WARNING: Trying again after setting bsize=";
  }
  for my $try_bsize (512, 2048, 4096) {
   $bsize=$try_bsize;
@@ -729,10 +768,10 @@ if ($signature eq "EFI PART") {
   if ($signature eq "EFI PART") {
    if ($noheaders <1) {
     printf " and this worked.\n";
+    printf "WARNING: Was given wrong paramer, now using bsize=$bsize\n";
     printf "Signature (valid): %s\n", $signature;
    }
    # noheaders or not, if the wrong information was given, say something
-   printf "WARNING: Wrong bsize was given, should have been $bsize\n";
    $lba=$offset_end/$bsize;
    # Update the LBA
    $device{lba}=$lba;
@@ -835,8 +874,12 @@ my @partitions = unpack "(a16)4", $mbr;
 
 # Loop through each MBR partition entry
 for my $i (0 .. 3) {
- # Extract the partition status, type, start sector, and sectors
- my ($status, $type, $start, $sectors) = unpack "C x3 C x3 V V", $partitions[$i];
+ # Extract the partition status, CHS first, type, CHS final, LBA start, and LBA sectors 
+ my ($status, $hcs_a, $hcs_b, $hcs_c, $type, $hcs_x, $hcs_y, $hcs_z, $start, $sectors) = unpack "C C3 C C3 V V", $partitions[$i];
+
+ # Preserve deprecated CHS fields as they can be used to decide on a LBA scheme
+ my $hcs_first=pack ("CCC", $hcs_a, $hcs_b, $hcs_c);
+ my $hcs_final=pack ("CCC", $hcs_x, $hcs_y, $hcs_z);
 
  #next if $type == 0;
  # DON'T skip empty partitions: it may be an isohybrid with a iso9660 filesystem
@@ -857,17 +900,41 @@ for my $i (0 .. 3) {
 
  # Print the partition number, status, type, start sector, end sector, size, and number of sectors
  printf "MBR Partition #%d: Start: %d, Stops: %d, Sectors: %d, Size: %d M\n", $i + 1, $start, $end, $sectors, $size;
+ if ($hcs_first eq "\xFF\xFF\xFF" and $hcs_final eq $hcs_first) {
+  print " HCS fields both 0xFFFFFF indicates LBA-48 mode\n";
+ } elsif ($hcs_first eq "\0\0\0" and $hcs_final eq $hcs_first) {
+  print " HCS fields both 0 indicates LBA-32 mode\n";
+ } elsif ($hcs_first eq "\xFE\xFF\xFF" or $hcs_final eq "\xFE\xFF\xFF") {
+  # WARNING: little endian
+  if ($hcs_first eq "\xFE\xFF\xFF") {
+   print " HCS first <FE><FF><FF> (LE) maxes out (c,h,s) to (1023, 255, 63), check partition type\n";
+  }
+  if ($hcs_final eq "\xFE\xFF\xFF") {
+   print " HCS final <FE><FF><FF> (LE) maxes out (c,h,s) to (1023, 255, 63), check partition type\n";
+  } else {
+   my ($c_first, $h_first, $s_first) = hcs_to_chs($hcs_first);
+   my ($c_final, $h_final, $s_final) = hcs_to_chs($hcs_final);
+   # bin to hex, should have used sprintf
+   my $first = unpack ("H*", $hcs_first);
+   my $final = unpack ("H*", $hcs_final);
+   print " HCS decoded to (c,h,s): span ($c_first, $h_final, $s_final) =$first to ($c_final, $h_final, $s_final) = $final\n";
+  } # <FE><FF><FF> either first or final
+ } # hcs fields
 
  # Populate the mbr partition hash
  $mbr_partitions{$i}{status}=$status;
+ $mbr_partitions{$i}{hcs_first_raw}=$hcs_first;
  $mbr_partitions{$i}{type}=$type;
+ $mbr_partitions{$i}{hcs_final_raw}=$hcs_final;
  $mbr_partitions{$i}{nick}=$nick;
  $mbr_partitions{$i}{start}=$start;
  $mbr_partitions{$i}{sectors}=$sectors;
 
  my $stat= sprintf ("%02x", $status);
  my $mbrtype= uc(sprintf ("%02x", $type));
- print " Nick: $nick, Text: $nick_to_mbrtext{$nick}, MBR type: $mbrtype, Status: $stat\n";
+ # WARNING: use {"$nick"} or 0700 becomes 7
+ my $test= $nick_to_mbrtext{"$nick"};
+ print " Nick: $nick, Text: $nick, MBR type: $mbrtype, Status: $stat\n";
  # if multiple partitions are defined to start at the same address, will only explore once
  if ($type == 0 and $noisodetect<1) {
   # look for ISO9660 signature: ASCII string CD001 and count how many there are
@@ -1197,14 +1264,15 @@ for my $r ( sort { $a <=> $b } keys %gpt_main_partitions) {
  } # else empty
 } # for
 
-# FIXME}
-
 ## Backup GPT partitions
 print "\n";
 print "# BACKUP GPT PARTITIONS:\n";
 
+# Should *end* at LBA -2, meaning must take into account the partition size
+# by default 128 partitions, 128 bytes each: so 16k before LBA-2
+
 # Use a negative number to go in the other direction, from the end
-seek $fh, -2*$bsize, 2 or die "Can't seek to backup GPT at LBA-2: $!\n";
+seek $fh, (-128*128)-1*$bsize, 2 or die "Can't seek to backup GPT ending at LBA-2: $!\n";
 # Then get the actual position
 my $gptbackup_offset = tell $fh;
 my $gptbackup_lba_offset=int($gptbackup_offset/$bsize);
@@ -1336,18 +1404,6 @@ for my $r ( sort { $a <=> $b } keys %gpt_backup_partitions) {
   # Print the partition number and information
   my $sectors=$backup_final_lba - $backup_first_lba + 1;
   my $size = int (($sectors * $bsize)/(1024*1024));
-  # Initial format
-  #print "BACKUP Partition $c:\n";
-  ##printf "BACKUP Type GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $type_guid;
-  #printf "BACKUP Type GUID: %s\n", guid_proper($type_guid);
-  ##printf "BACKUP Partition GUID ko: %s\n", join "-", unpack "H8 H4 H4 H4 H12", $part_guid;
-  #printf "BACKUP Partition GUID: %s\n", guid_proper($part_guid);
-  #printf "BACKUP First LBA: %d\n", $first_lba;
-  #printf "BACKUP Final LBA: %d\n", $final_lba;
-  #printf "BACKUP Size: %d\n", $final_lba - $first_lba + 1;
-  #printf "BACKUP Sectors: %d\n", $final_lba - $first_lba + 1;
-  #printf "BACKUP Attributes: %016x\n", $attr;
-  #printf "BACKUP Name: %s\n", $name;
   # New simpler format
   if ($divergent>0) {
    print "DIVERGENCE: BACKUP GPT Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";

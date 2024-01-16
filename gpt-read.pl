@@ -327,9 +327,9 @@ for my $r ( sort { $a <=> $b } keys %partitions) {
   # New simpler format
   my $guid_seps=guid_proper($type_guid);
   print "Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
-  print " Name: $name, GUID: $guid_seps\n";
+  print "Name: $name, GUID: $guid_seps\n";
   if ($attr>0) {
-   print " Attributes bits set: ";
+   print "Attributes bits set: ";
     # loop through the bits of the attributes
     for my $j (0 .. 63) {
      # check if the bit is set
@@ -350,13 +350,15 @@ for my $r ( sort { $a <=> $b } keys %partitions) {
 ## Secondary GPT header
 # should have $other_lba by the end of the disk:
 # LBA      Z-33: last usable sector
-# LBA       Z-2:  GPT partition table (backup)
+# LBA       Z-2:  end of GPT partition table (backup)
 # LBA       Z-1:  GPT header (backup)
 # LBA         Z: end of disk
 print "\n";
 
-# Use a negative number to go in the other direction, from the end
-seek $fh, -1*$bsize, 2 or die "Can't seek to BACKUP header at LBA-2: $!\n";
+# Backup table position:
+# Table should *end* at LBA -2, but must take into account the table size
+# By default 128 partitions, 128 bytes each: so 16k before LBA-2
+seek $fh, (-128*128)-1*$bsize, 2 or die "Can't seek to backup GPT ending at LBA-2: $!\n";
 # Then get the actual position
 my $other_offset = tell $fh;
 my $other_lba_offset=int($other_offset/$bsize);
@@ -644,7 +646,7 @@ for my $r ( sort { $a <=> $b } keys %backup_partitions) {
    or $partitions{$c}{name} ne $name) {
     $divergent=1;
   }
-  
+
   # Print the partition number and information
   my $sectors=$backup_final_lba - $backup_first_lba + 1;
   my $size = int (($sectors * $bsize)/(1024*1024));
