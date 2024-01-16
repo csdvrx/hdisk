@@ -16,6 +16,15 @@ my $isodetect=0;
 # Open the block device for reading in binary mode
 open my $fh, "<:raw", $device or die "Can't open $device: $!\n";
 
+my $mbrbootcode;
+read $fh, $mbrbootcode, 440 , 0;
+if ($mbrbootcode=~ m/^\0*$/) {
+ print "WARNING: MBR bootcode empty, must be a GPT system\n";
+} else {
+ my $mbrbootcode_pack=unpack "H440", $mbrbootcode;
+ print "Bootcode dump: $mbrbootcode_pack\n"; 
+}
+
 # Seek to 440 (near the MBR end at offset 446)
 seek $fh, 440, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
 my $sigs;
