@@ -37,7 +37,7 @@ print "# INITIAL PARTITIONS:\n";
 # Loop through each partition entry
 for my $i (0 .. 3) {
  # Extract the partition status, type, start sector, and size
- my ($status, $type, $start, $size) = unpack "C x3 C x3 V V", $partitions_initial[$i];
+ my ($status, $chs_firstsector, $type, $chs_finalsector, $start, $size) = unpack "C C3 C C3 V V", $partitions_initial[$i];
 
  # DON'T Skip empty partitions
  #next if $type == 0;
@@ -48,10 +48,13 @@ for my $i (0 .. 3) {
 
  # Print the partition number, status, type, start sector, end sector, size, and number of sectors
  printf "Partition %d: Status: %02x, Type: %02x, Start: %d, End: %d, Size: %d, Sectors: %d\n", $i + 1, $status, $type, $start, $end, $size, $sectors;
+ printf " CHS: %d=first:%08b, %d=final:%08b deprecated but inform LBA ATA specs\n", $chs_firstsector, $chs_firstsector, $chs_finalsector, $chs_finalsector;
 
  # Populate the data structure
  $partitions{$i}{status}=$status;
+ $partitions{$i}{chs_first_deprecated}=$chs_firstsector;
  $partitions{$i}{type}=$type;
+ $partitions{$i}{chs_final_deprecated}=$chs_finalsector;
  $partitions{$i}{start}=$start;
  $partitions{$i}{end}=$end;
  $partitions{$i}{size}=$size;
@@ -109,11 +112,16 @@ if ($partitions{2}{type}==0x83) {
 # Can then pack a new tweaked MBR
 my $mbr_tweaked;
 for my $i (0 .. 3) {
- my $partition_entry= pack 'C x3 C x3 V V', 
+ #my ($status, $type, $start, $size) = unpack "C x3 C x3 V V", $partitions_initial[$i];
+ my $partition_entry= pack 'C C3 C C3 V V', 
   $partitions{$i}{status},
+  $partitions{$i}{chs_first_deprecated},
   $partitions{$i}{type},
+  $partitions{$i}{chs_first_deprecated},
   $partitions{$i}{start},
   $partitions{$i}{size};
+  my $mbr_i=unpack "H16", $partition_entry;
+  print "Entry $i is $mbr_i\n";
  $mbr_tweaked .= $partition_entry;
 }
 
