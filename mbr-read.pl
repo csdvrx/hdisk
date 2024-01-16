@@ -100,9 +100,9 @@ for my $i (0 .. 3) {
  # Extract the partition status, type, start sector, and size
  #my ($status, $type, $start, $size) = unpack "C x3 C x3 V V", $partitions[$i];
  # No longer ignoring the 24 bits of each chs fields:
- my ($status, $hcs_a, $hcs_b, $hcs_c, $type, $hcs_x, $hcs_y, $hcs_z, $lba_start, $size) = unpack "C H H H C H H H C V V", $partitions[$i];
- my $hcs_first=pack ("HHH", $hcs_a, $hcs_b, $hcs_c);
- my $hcs_final=pack ("HHH", $hcs_x, $hcs_y, $hcs_z);
+ my ($status, $hcs_a, $hcs_b, $hcs_c, $type, $hcs_x, $hcs_y, $hcs_z, $lba_start, $size) = unpack "C CCC C CCC C V V", $partitions[$i];
+ my $hcs_first=pack ("CCC", $hcs_a, $hcs_b, $hcs_c);
+ my $hcs_final=pack ("CCC", $hcs_x, $hcs_y, $hcs_z);
 
  # Pack-Unpack types:
  #cf https://catonmat.net/ftp/perl.pack.unpack.printf.cheat.sheet.pdf
@@ -121,6 +121,8 @@ for my $i (0 .. 3) {
 
  # Print the partition number, status, type, start sector, end sector, size, and number of sectors
  printf "Partition #%d: Status: %02x, Type:%02x, Start: %d, End: %d, Size: %d, Sectors: %d\n", $i + 1, $status, $type, $lba_start, $end, $size, $sectors;
+ my $dump_i=unpack "H16", $partitions[$i];
+ print " Hexdump: $dump_i\n";
  # if multiple partitions are defined to start at the same address, will only explore once
  if ($type == 0) {
   # DON'T skip empty partitions: it may be an isohybrid with a iso9660 filesystem
