@@ -45,7 +45,9 @@ Here I present what I call the "3 boots" (MBR, UEFI, optical media): if each one
 
 (*): Note that while UEFI is supported by some hardware using ARM CPUs (both for Microsoft Windows or Apple MacOS), for most ARM devices like Google Android cellphones and tablets, UEFI is not yet an acceptable solution: instead, these devices use a devicetree and a custom bootloader like uBoot.
 
-The exception is Google chromebooks which use coreboot, a free-software BIOS, which can interface with these boots through seabios (BIOS) or tianocore (UEFI).
+The exception is Google chromebooks which use coreboot, a free-software BIOS, which can interface with these boots through seabios (BIOS) or tianocore (UEFI). Likewise, on Risc-V (not supported by cosmopolitan yet), opensbi runs edk2 (UEFI) as a payload.
+
+Devicetrees have an equivalent on UEFI systems: ACPI. Both DT and ACPI list the hardware and necessary hardware properties. The firmware can then initialize the hardware using drivers. DT allow/require building the drivers right into the Linux kernel. ACPI is not technically required in UEFI, and is not perfect, but make booting much more generic. By standardizing the interface, UEFI can boot any OS. It's up to the OS to have the right driver and maybe check the ACPI tables, but at least that's not required at boot time.
 
 Overall, this means the boot can't yet be UEFI only: it needs to be supplemented by at least another boot method, and maybe more.
 
