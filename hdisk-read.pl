@@ -680,6 +680,11 @@ my $mbrbootcode;
 read $fh, $mbrbootcode, $hardcoded_mbr_bootcode_size, 0;
 if ($mbrbootcode=~ m/^\0*$/) {
  print "Note: MBR bootcode empty, must be a GPT system\n";
+} elsif ($mbrbootcode=~ m/^\x7b\0*$/) {
+ print "Note: MBR bootcode 7b, disk non bootable\n";
+} else {
+ my $mbrbootcode_pack=unpack "H$hardcoded_mbr_bootcode_size", $mbrbootcode;
+ print "Bootcode dump: $mbrbootcode_pack\n";
 }
 
 # Seek to 440 (near the MBR end at offset 446)
@@ -768,10 +773,10 @@ if ($signature eq "EFI PART") {
   if ($signature eq "EFI PART") {
    if ($noheaders <1) {
     printf " and this worked.\n";
-    printf "WARNING: Was given wrong paramer, now using bsize=$bsize\n";
-    printf "Signature (valid): %s\n", $signature;
    }
    # noheaders or not, if the wrong information was given, say something
+   printf "WARNING: Was given wrong parameter, now using bsize=$bsize\n";
+   printf "Signature (valid): %s\n", $signature;
    $lba=$offset_end/$bsize;
    # Update the LBA
    $device{lba}=$lba;
@@ -1272,7 +1277,15 @@ print "# BACKUP GPT PARTITIONS:\n";
 # by default 128 partitions, 128 bytes each: so 16k before LBA-2
 
 # Use a negative number to go in the other direction, from the end
-seek $fh, (-128*128)-1*$bsize, 2 or die "Can't seek to backup GPT ending at LBA-2: $!\n";
+my $backuptable_size_guess;
+if (defined($backup_num_parts) and defined($backup_part_size)) {
+ $backuptable_size_guess=-$backup_num_parts*$backup_part_size;
+} elsif (defined($num_parts) and defined ($part_size)) {
+ $backuptable_size_guess=-$num_parts*$part_size
+} else {
+ $backuptable_size_guess=-128*128;
+}
+seek $fh, $backuptable_size_guess-1*$bsize, 2 or die "Can't seek to backup GPT ending at LBA-2: $!\n";
 # Then get the actual position
 my $gptbackup_offset = tell $fh;
 my $gptbackup_lba_offset=int($gptbackup_offset/$bsize);
