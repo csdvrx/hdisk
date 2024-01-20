@@ -155,6 +155,69 @@ sub mbr_hcs_to_chs {
  return ($c, $h, $s);
 }
 
+## Read a MBR header from a fh and a geometry
+sub mbr_read_header {
+ my ($fh, $geometry_ref)=@_;
+ my %geometry=%{ $geometry_ref };
+ # outputs
+ my $textinfo="";
+ my %mbr_header;
+ # make sure the size is > 440 to read the bootcode
+ if ($geometry{end} > $hardcoded_mbr_bootcode_size) {
+  if ($noheaders <1) {
+   print "\n# READING MBR HEADER:\n";
+  }
+  # Read the bootcode: not just for showing it but to know if bootable
+  my $mbrbootcode;
+  read $fh, $mbrbootcode, $hardcoded_mbr_bootcode_size, 0;
+  if ($mbrbootcode=~ m/^\0*$/) {
+   $textinfo=$textinfo . "Note: MBR bootcode empty, must be a GPT system\n";
+  } elsif ($mbrbootcode=~ m/^\x7b\0*$/) {
+   $textinfo=$textinfo . "Note: MBR bootcode 7b, disk non bootable\n";
+  } else {
+   my $mbrbootcode_pack=unpack "H$hardcoded_mbr_bootcode_size", $mbrbootcode;
+   $textinfo=$textinfo . "Bootcode dump: $mbrbootcode_pack\n";
+  }
+  $mbr_header{bootmbr}=$mbrbootcode;
+ } # if > 440
+ # make sure the size is > 446 to read the signatures
+ if ($geometry{end} > $hardcoded_mbr_bootcode_size+$hardcoded_mbr_signature_size) {
+  # Seek to 440 (near the MBR end at offset 446)
+  seek $fh, $hardcoded_mbr_bootcode_size, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
+  my $mbrsigs;
+  read $fh, $mbrsigs, $hardcoded_mbr_signature_size or die "Can't read the MBR signatures: $!\n";
+  # at 440 there are 4 bytes for the disk number (signature)
+  # at 444 there should be 2 null bytes that have been historically reserved
+  my ($disksig, $nullsig) = unpack 'H8a2', $mbrsigs;
+  # Then check that at 510, there's the expected 2 bytes boot signature
+  my $mbr_bootsig_offset=$hardcoded_mbr_bootcode_size + $hardcoded_mbr_signature_size + $hardcoded_mbr_size;
+  seek $fh, $mbr_bootsig_offset, 0 or die "Can't seek to MBR boot signature: $!\n";
+  my $bootsig;
+  read $fh, $bootsig, $hardcoded_mbr_bootsig_size or die "Can't read MBR boot signature: $!\n";
+  my $bootsig_le=unpack ("H4", $bootsig);
+  my $disksig_le=unpack ("V", pack ("H8", $disksig));
+  # Show the MBR headers
+  $textinfo=$textinfo . sprintf "Disk UUID: %08x\n", $disksig_le;
+  # Should be 0x55aa in little endian
+  if ($bootsig eq "\x55\xaa") {
+  $textinfo=$textinfo . "Signature (valid): $bootsig_le\n";
+  } else {
+   $textinfo=$textinfo . "Signature (WARNING: INVALID): $bootsig_le\n";
+  }
+  # Could have other uses, but in practice never not null
+  if ($nullsig eq "\x00\x00") {
+   $textinfo=$textinfo . "2 null bytes (valid): $nullsig(obviously not visible)\n";
+  } else {
+   $textinfo=$textinfo . print "2 null bytes (WARNING: NOT NULL): $nullsig\n";
+  }
+  # Populate the mbr header hash
+  $mbr_header{bootsig}=$bootsig_le;
+  $mbr_header{disksig}=$disksig_le;
+  $mbr_header{nullsig}=$nullsig;
+ } # if > 446
+ return ($textinfo, \%mbr_header)
+} # sub
+
 ########################################################### GPT SUBFUNCTIONS
 
 ## GPT attributes from bits to a hash of set bits + text
@@ -232,18 +295,141 @@ sub gpt_guid_encode {
 }
 
 # Names are just as strange: due to UTF16-LE, null bytes between ascii
+sub gpt_name_decode {
+ my $input=shift;
+ my $output = $input;
+ # Remove the null bytes
+ $output=~tr/\0//d;
+ return ($output);
+}
+
+# Add back the null bytes and pad with more to the expected record size
 sub gpt_name_encode {
  my $input=shift;
  my $output = "";
  for my $char (split //, $input) {
     $output .= $char . "\0";
   }
- # Pad the output will null bytes as needed to match the record size
  $output .= "\x00" x ($hardcoded_gpt_partname_size - length $output);
  return $output;
 }
 
+
 ########################################################### OTHER SUBFUNCTIONS
+
+# Read the geometry of a file handler with a specific block size
+sub read_geometry {
+ # Inputs: filehander and bsize
+ my $fh=shift;
+ my $bsize=shift;
+ # Outputs: geometry hash and textual information
+ my %geometry;
+ my $textinfo="";
+ # Size estimate: seek (,,whence): whence=2 to EOF, 0 to start, 1 to curpos
+ seek $fh, -1, 2 or die "Can't seek to the end: $!\n";
+ my $offset_end=tell $fh;
+ # compensate the -1 by a +1:
+ $geometry{end}=$offset_end+1;
+ my $device_size_G=($offset_end+1)/(1024**3);
+ $geometry{sizeG}=$device_size_G;
+ $geometry{block_size}=$bsize;
+ my $lba=($offset_end+1)/$bsize;
+ $geometry{lba}=$lba;
+ my $lba_int=int($lba);
+ $textinfo = sprintf "Size %.2f G, $lba rounds to total LBA: $lba_int\n", $device_size_G;
+
+ # Check if goes beyond the end of a few usual LBA-bit MBR space:
+ # 22 bit (original IDE): not needed
+ # 28 bit (ATA-1 from 1994), 32 bit (MBRs), 48 bit (ATA-6 from 2003): helps
+ for my $i (28, 32, 48) {
+  if ($offset_end > (2**$i) ) {
+   # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
+   $textinfo = $textinfo. "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
+  } # if
+ } # for my i
+ return ($textinfo, \%geometry);
+} # sub
+
+## Look for El Torito signatures
+sub isodetect {
+ # Inputs: a fh, a starting point, and a list of offset to ignore
+ my ($fh, $start, $already_explored_ref)=@_;
+
+ # Outputs: some information, and a hash of offsets
+ my $textinfo="";
+ my %isosigs;
+ # look for ISO9660 signature: ASCII string CD001 and count how many there are
+ # usually occurs at offset 32769 (0x8001), 34817 (0x8801), or 36865 (0x9001):
+ #  32769 is the Primary Volume Descriptor (PVD) of an ISOFS:
+ #    at LBA 0x10=16, and each block is 2048 bytes long
+ #    so offset: 16 * 2048 + 1 = 32769
+ #  34817 is the Supplementary Volume Descriptor (SVD) for Joliet extensions:
+ #    at the LBA 17, so the offset is 17 * 2048 + 1 = 34817
+ #  37633: is the Boot Record Volume Descriptor (BRVD):
+ #    at the LBA 19, so the offset is 19 * 2048 + 1 = 37633
+ #
+ # And so on: 18*2048+1=36865, 19*2048+1= 38913: just check final type=255
+ my $isosig_nbr=0;
+ # Volume descriptors start at LBA X+16, seems it can start again at LBA X+32
+ # So should check at different LBAs:
+ #  - from the beginning of the drive: X=0, LBA=X+vd_lba_start
+ #  - from the beginning of the partition: X=start, LBA=X+vd_lba_start
+ for my $begin (0, $start) {
+  my @vd_lbas_starts=(0, 16, 32);
+  for my $vd_start (@vd_lbas_starts) {
+   # So add this vd_lba_start
+   my $lba=$begin + $vd_start;
+   # But don't explore again the same lba: check the hash
+   if ($debug_isodetect>0) {
+    if (defined $already_explored_ref->{$lba}) {
+     $textinfo = $textinfo . " (already explored $lba)\n";
+    }
+    $textinfo = $textinfo . " - checking LBA $lba for volume descriptor start $vd_start at start $start\n";
+   } # if debug
+   unless (defined $already_explored_ref->{$lba}) {
+    # Mark it as explored
+    $already_explored_ref->{$lba}=1;
+    my $type=0;
+    until ($type > 254) {
+     my $offset=$lba*2048;
+     my $vd;
+     seek $fh, $offset, 0 or $mbr_isosig_inaccessible=1;
+     if ($mbr_isosig_inaccessible==1) {
+      $textinfo = $textinfo . "Can't seek to iso signature at LBA $lba: $!\n";
+      # Not really true, but it will serve to break the loop: >254
+      $vd=pack("C A5", 0xff, "    ");
+     }
+     read $fh, $vd, $hardcoded_isovold_size or $mbr_isosig_inaccessible=2;
+     if ($mbr_isosig_inaccessible==2) {
+      if ($debug_isodetect>1) {
+       $textinfo = $textinfo . "Can't read 64 bytes of volume descriptor at LBA $lba: $!\n";
+      }
+      # Not really, but it will serve to break the loop: >254
+      $vd=pack("C A5", 255, "    ");
+     }
+     my $isosig;
+     ($type, $isosig)= unpack ("C A5", $vd);
+     if ($isosig =~ m/^CD001$/) {
+      $textinfo = $textinfo . "\tseen CD001 at lba: $lba, offset: $offset, type: $type\n";
+      $isosig_nbr=$isosig_nbr+1;
+      # we found something!
+      $isosigs{$lba}=$type;
+     } else {
+      # Not really, but it will serve to break the loop
+      $type=256;
+     }
+     $lba=$lba+1;
+    } # until type
+   } # unless already_explored_ref
+  } # for my vd_start
+ } # for my begin
+ if ($isosig_nbr>2) {
+  $textinfo = $textinfo . "\tthus not type 00=empty but has an ISO9600 filesystem\n";
+ }
+ # Populate the nbr field of the return hash
+ $isosigs{nbr}=$isosig_nbr;
+ return ($textinfo, \%isosigs, $already_explored_ref);
+}
 
 # Compare byte-by-byte to help debugging such null bytes or endianness issues
 sub compare_two_strings {
@@ -883,8 +1069,8 @@ unless ($bsize=shift @ARGV) {
  $bsize=$hardcoded_default_block_size;
 }
 
-## Device or image information like size and LBA blocks
-my %geometry;
+########################################################### READ GEOMETRY
+
 if ($nodevinfo <1) {
  print "# DEVICE:\n";
 }
@@ -897,93 +1083,21 @@ if ($nodevinfo <1) {
 # Open the block device for reading in binary mode
 open my $fh, "<:raw", $path or die "Can't open $path: $!\n";
 
-########################################################### READ GEOMETRY
+## Device or image information like size and LBA blocks
+my ($infos_geom, $geometry_ref)= read_geometry($fh, $bsize);
+my %geometry = %{ $geometry_ref };
 
-# Size estimate: seek (,,whence): whence=2 to EOF, 0 to start, 1 to curpos
-seek $fh, -1, 2 or die "Can't seek to the end: $!\n";
-my $offset_end=tell $fh;
-# compensate the -1 by a +1:
-$geometry{end}=$offset_end+1;
-my $device_size_G=($offset_end+1)/(1024**3);
-$geometry{block_size}=$bsize;
-my $lba=($offset_end+1)/$bsize;
-$geometry{lba}=$lba;
-my $lba_int=int($lba);
 if ($nodevinfo <1) {
- printf "Size %.2f G, $lba rounds to total LBA: $lba_int\n", $device_size_G;
+ print $infos_geom;
 }
-# Check if goes beyond the end of a few usual LBA-bit MBR space:
-# 22 bit (original IDE): not needed
-# 28 bit (ATA-1 from 1994), 32 bit (MBRs), 48 bit (ATA-6 from 2003): helps
-for my $i (28, 32, 48) {
- if ($offset_end > (2**$i) ) {
-  # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
-  if ($nodevinfo <1) {
-   print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
-  } # if
- } # if
-} # for my i
-
-########################################################### READ MBR "HEADER"
 
 # Only two properties + bootable, but might as well use a hash everywhere
-my %mbr_header;
+my ($infos_mbrh, $mbr_header_ref) = mbr_read_header($fh, \%geometry);
+my %mbr_header = %{ $mbr_header_ref };
 
-if ($geometry{end} > $hardcoded_mbr_bootcode_size) {
- if ($noheaders <1) {
-  print "\n# READING MBR HEADER:\n";
- }
- # Read the bootcode: not just for showing it but to know if bootable
- my $mbrbootcode;
- read $fh, $mbrbootcode, $hardcoded_mbr_bootcode_size, 0;
- if ($mbrbootcode=~ m/^\0*$/) {
-  print "Note: MBR bootcode empty, must be a GPT system\n";
- } elsif ($mbrbootcode=~ m/^\x7b\0*$/) {
-  print "Note: MBR bootcode 7b, disk non bootable\n";
- } else {
-  my $mbrbootcode_pack=unpack "H$hardcoded_mbr_bootcode_size", $mbrbootcode;
-  print "Bootcode dump: $mbrbootcode_pack\n";
- }
- $mbr_header{bootmbr}=$mbrbootcode;
-} # if > 440
-
-
-if ($geometry{end} > $hardcoded_mbr_bootcode_size+$hardcoded_mbr_signature_size) {
- # Seek to 440 (near the MBR end at offset 446)
- seek $fh, $hardcoded_mbr_bootcode_size, 0 or die "Can't seek to offset 440 near the end of the MBR: $!\n";
- my $mbrsigs;
- read $fh, $mbrsigs, $hardcoded_mbr_signature_size or die "Can't read the MBR signatures: $!\n";
- # at 440 there are 4 bytes for the disk number (signature)
- # at 444 there should be 2 null bytes that have been historically reserved
- my ($disksig, $nullsig) = unpack 'H8a2', $mbrsigs;
- # Then check that at 510, there's the expected 2 bytes boot signature
- my $mbr_bootsig_offset=$hardcoded_mbr_bootcode_size + $hardcoded_mbr_signature_size + $hardcoded_mbr_size;
- seek $fh, $mbr_bootsig_offset, 0 or die "Can't seek to MBR boot signature: $!\n";
- my $bootsig;
- read $fh, $bootsig, $hardcoded_mbr_bootsig_size or die "Can't read MBR boot signature: $!\n";
- my $bootsig_le=unpack ("H4", $bootsig);
- my $disksig_le=unpack ("V", pack ("H8", $disksig));
- # Show the MBR headers
- if ($noheaders <1) {
-  printf "Disk UUID: %08x\n", $disksig_le;
-  # Should be 0x55aa in little endian
-  if ($bootsig eq "\x55\xaa") {
-   printf "Signature (valid): $bootsig_le\n";
-  } else {
-   printf "Signature (WARNING: INVALID): $bootsig_le\n";
-  }
-  # Could have other uses, but in practice never not null
-  if ($nullsig eq "\x00\x00") {
-   printf "2 null bytes (valid): $nullsig(obviously not visible)\n";
-  } else {
-   printf "2 null bytes (WARNING: NOT NULL): $nullsig\n";
-  }
- } # if noheader
- # Populate the mbr header hash
- $mbr_header{bootsig}=$bootsig_le;
- $mbr_header{disksig}=$disksig_le;
- $mbr_header{nullsig}=$nullsig;
-} # if > 446
+if ($noheaders <1) {
+ print $infos_mbrh;
+}
 
 ########################################################### READ GPT HEADER
 
@@ -1068,24 +1182,12 @@ unless ($geometry{end} > $geometry{block_size}+$hardcoded_gpt_header_size) {
     # noheaders or not, if the wrong information was given, say something
     printf "WARNING: Was given wrong paramer, now using bsize=$try_bsize\n";
     printf "Signature (valid): %s\n", $signature;
-    $lba=$offset_end/$try_bsize;
     # Update the LBA and block size in the device hash
-    $geometry{lba}=$lba;
-    $geometry{block_size}=$try_bsize;
-    $lba_int=int($lba);
+    ($infos_geom, %geometry)= read_geometry($fh, $try_bsize);
     if ($nodevinfo <1) {
-     printf "Size %.2f G, rounds to $lba_int LBA blocks for $lba\n", $device_size_G;
+     print $infos_geom;
     }
-    # Check if goes beyond the end of a few usual LBA-bit MBR space:
-    # 22 bit (original IDE), 28 bit (ATA-1 from 1994), 48 bit (ATA-6 from 2003)
-    for my $i (28, 32, 48) {
-     if ($offset_end > (2**$i) ) {
-      # Warn that MBR entries store LBA offsets and sizes as 32 bit little endians
-      if ($nodevinfo <1) {
-       print "WARNING: this is more than LBA-$i can handle (many MBR use LBA-32)\n";
-      }
-     } # if
-    } # for i
+
    } # if signature 2nd attempt
   } # for try_bsize
  } # else signature
@@ -1186,7 +1288,7 @@ if ($geometry{end} > $geometry{block_size} + $hardcoded_mbr_bootcode_size + $har
  }
  # Keep track separately of what LBAs have been explored for CD001 signatures
  # (in case of partitions overlap)
- my %isosig_explored;
+ my %isosigs_explored;
 
  # Seek back to the MBR location at offset 446
  seek $fh, $hardcoded_mbr_bootcode_size+$hardcoded_mbr_signature_size, 0 or die "Can't seek to MBR: $!\n";
@@ -1223,7 +1325,7 @@ if ($geometry{end} > $geometry{block_size} + $hardcoded_mbr_bootcode_size + $har
   my $nick = lc(sprintf("%02x",$type)) . "00";
 
   # Print the partition number, status, type, start sector, end sector, size, and number of sectors
-  printf "MBR Partition #%d: Start: %d, Stops: %d, Sectors: %d, Size: %d M\n", $i + 1, $start, $end, $sectors, $size;
+  printf "MBR partition #%d: Start: %d, Stops: %d, Sectors: %d, Size: %d M\n", $i + 1, $start, $end, $sectors, $size;
 
   if ($hcs_first eq "\xFF\xFF\xFF" and $hcs_final eq $hcs_first) {
    print " HCS fields both 0xFFFFFF indicates LBA-48 mode\n";
@@ -1263,75 +1365,10 @@ if ($geometry{end} > $geometry{block_size} + $hardcoded_mbr_bootcode_size + $har
   print " Nick: $nick, Text: $text, MBR type: $mbrtype, Status: $stat\n";
   # Only explore once if multiple partitions are defined to start at the same address
   if ($type == 0 and $noisodetect<1) {
-   # look for ISO9660 signature: ASCII string CD001 and count how many there are
-   # usually occurs at offset 32769 (0x8001), 34817 (0x8801), or 36865 (0x9001):
-   #  32769 is the Primary Volume Descriptor (PVD) of an ISOFS:
-   #    at LBA 0x10=16, and each block is 2048 bytes long
-   #    so offset: 16 * 2048 + 1 = 32769
-   #  34817 is the Supplementary Volume Descriptor (SVD) for Joliet extensions:
-   #    at the LBA 17, so the offset is 17 * 2048 + 1 = 34817
-   #  37633: is the Boot Record Volume Descriptor (BRVD):
-   #    at the LBA 19, so the offset is 19 * 2048 + 1 = 37633
-   #
-   # And so on: 18*2048+1=36865, 19*2048+1= 38913: just check final type=255
-   my $isosig_nbr=0;
-   # Volume descriptors start at LBA X+16, seems it can start again at LBA X+32
-   # So should check at different LBAs:
-   #  - from the beginning of the drive: X=0, LBA=X+vd_lba_start
-   #  - from the beginning of the partition: X=start, LBA=X+vd_lba_start
-   for my $begin (0, $start) {
-    my @vd_lbas_starts=(0, 16, 32);
-    for my $vd_start (@vd_lbas_starts) {
-     # So add this vd_lba_start
-     my $lba=$begin + $vd_start;
-     # But don't explore again the same lba: check the hash
-     if ($debug_isodetect>0) {
-      if (exists $isosig_explored{$lba}) {
-       print " (already shown its data at $lba in previous partition #$isosig_explored{$lba})\n";
-      }
-      print " - checking LBA $lba for volume descriptor start $vd_start at partition start $start\n";
-     } # if debug
-     unless (defined $isosig_explored{$lba}) {
-      # Mark it as explored
-      $isosig_explored{$lba}=$i+1;
-      my $type=0;
-      until ($type > 254) {
-       my $offset=$lba*2048;
-       my $vd;
-       seek $fh, $offset, 0 or $mbr_isosig_inaccessible=1;
-       if ($mbr_isosig_inaccessible==1) {
-        print "Can't seek to iso signature at LBA $lba: $!\n";
-        # Not really true, but it will serve to break the loop: >254
-        $vd=pack("C A5", 0xff, "    ");
-       }
-       read $fh, $vd, $hardcoded_isovold_size or $mbr_isosig_inaccessible=2;
-       if ($mbr_isosig_inaccessible==2) {
-        # TODO: consider removing: unhelpful if the image is clearly too small
-	if ($debug_isodetect>1) {
-         print "Can't read 64 bytes of volume descriptor at LBA $lba: $!\n";
-	}
-        # Not really, but it will serve to break the loop: >254
-        $vd=pack("C A5", 255, "    ");
-       }
-       my $isosig;
-       ($type, $isosig)= unpack ("C A5", $vd);
-       if ($isosig =~ m/^CD001$/) {
-        print "\tseen CD001 at lba: $lba, offset: $offset, type: $type\n";
-        $isosig_nbr=$isosig_nbr+1;
-       } else {
-        # Not really, but it will serve to break the loop
-        $type=256;
-       }
-       $lba=$lba+1;
-      } # until type
-     } # unless isosig_explored
-    } # for my vd_start
-   } # for my begin
-   if ($isosig_nbr>2) {
-    print ("\tthus not type 00=empty but has an ISO9600 filesystem\n");
-   }
-   # Save to the hash, regardless of the value
-   $mbr_partitions{$i}{isosig}=$isosig_nbr;
+   my ($info_isos, $isosigs_found_ref) = isodetect($fh, $start, \%isosigs_explored);
+   print $info_isos;
+   # Save just the values to the mbr_partitions hash
+   $mbr_partitions{$i}{isosig}=$isosigs_found_ref->{nbr};
   } # if type 0
  } # for my i
 } # if $geometry{end} > 510
@@ -1397,9 +1434,9 @@ unless ($geometry{end} > 3*($geometry{block_size})+128*128) {
  # And check if it matches: then $other_lba is by the end of the disk
  if ($noheaders <1) {
   if ($gptheader_main{other_lba} == $other_lba_offset) {
-   print "BACKUP GPT header (valid offset for LBA-1 -> $other_offset): $gptheader_main{other_lba}\n";
+   print "BACKUP GPT header (valid offset for LBA-1 -> LBA=$other_offset): $gptheader_main{other_lba}\n";
   } else {
-   print "BACKUP GPT header (WARNING: INVALID OFFSET SINCE LBA-1 -> $other_lba_offset != $other_offset): $gptheader_main{other_lba}\n";
+   print "BACKUP GPT header (WARNING: INVALID OFFSET SINCE LBA-1 -> LBA=$other_lba_offset != $other_offset): $gptheader_main{other_lba}\n";
    # If not, store that possible discrepency in the hash
    $gptheader_main{other_lba_unexpected}=$other_lba_offset;
    # Then triggers a rewrite of everything, to get and store the correct other_lba
@@ -1431,7 +1468,7 @@ unless ($geometry{end} > 3*($geometry{block_size})+128*128) {
       0, 0, 0, 0 ,0,
       0, 0, 0, 0);
    if ($noheaders <1) {
-    printf "WARNING: BACKUP flushed\n";
+    printf "WARNING: signature incorrect so BACKUP flushed\n";
    }
   } else { # unless signature and revision good
    if ($backup_header_crc32check == $backup_header_crc32own) {
@@ -1577,13 +1614,13 @@ print "\n# READING MAIN GPT PARTITIONS:\n";
 # only provide fallback values if couldn't read from the main:
 #  - by default 128 partitions, 128 bytes each
 #  - but should use the numbers just read if possible
-my $table_size_guess;
+my $gptpartst_size_guess;
 if (defined($gptheader_main{num_parts}) and defined($gptheader_main{part_size})) {
- $table_size_guess=$gptheader_main{num_parts}*$gptheader_main{part_size};
+ $gptpartst_size_guess=$gptheader_main{num_parts}*$gptheader_main{part_size};
 } else {
  # guess for real
  print "WARNING: GPT partition table size guesstimated to 128^2\n";
- $table_size_guess=128**2;
+ $gptpartst_size_guess=128**2;
 }
 
 # If using a disk image, it needs to be at least:
@@ -1595,7 +1632,7 @@ if (defined($gptheader_main{num_parts}) and defined($gptheader_main{part_size}))
 #  - 3*bsize+128*128 to have a gpt backup header (and no actual data!)
 #  - 3*bsize+2*(128*128) to have both gpt backups (yet no actual data!)
 
-unless ($geometry{end} > $geometry{block_size}+$hardcoded_gpt_header_size+$table_size_guess) {
+unless ($geometry{end} > $geometry{block_size}+$hardcoded_gpt_header_size+$gptpartst_size_guess) {
  print "WARNING: looks too small to have a full GPT partition table\n";
  $gpt_partst_inaccessible=1;
 }
@@ -1618,12 +1655,12 @@ unless ($gpt_header_inaccessible>0) {
  my $gptparts_offset=$gptheader_main{gptparts_lba}*$geometry{block_size};
  seek $fh, $gptparts_offset, 0 or $gpt_partst_inaccessible=3;
  #die "Can't seek to the GPT lba $gptparts_lba: $!\n";
- read $fh, $gptparts, $table_size_guess or $gpt_partst_inaccessible=4;
+ read $fh, $gptparts, $gptpartst_size_guess or $gpt_partst_inaccessible=4;
  #die "Can't read the GPT at $num_parts*$part_size: $!\n";
  if ($gpt_partst_inaccessible>1 ) {
   # Replace what should have been read by null bytes regardless why not available
   print "WARNING: GPT PARTITIONS implausible ($gpt_partst_inaccessible), assuming empty";
-  $gptparts="\0"x $table_size_guess;
+  $gptparts="\0"x $gptpartst_size_guess;
  }
  # crc32 what we just read to inform the gpt main header hash of the validity
  if ($gptheader_main{gptparts_crc32own} == crc32($gptparts)) {
@@ -1644,8 +1681,8 @@ unless ($gpt_header_inaccessible>0) {
  my @partitions_raw_gpt_primary;
 
  # In case of partial read (ex: 3k instead of 16k), truncate to 128, and fix
- if (length($gptparts)< $table_size_guess) {
-  print "WARNING: only read " . length($gptparts) . "b instead of guessed $table_size_guess\n";
+ if (length($gptparts)< $gptpartst_size_guess) {
+  print "WARNING: only read " . length($gptparts) . "b instead of guessed $gptpartst_size_guess\n";
  }
 
  # Split gpt partitions records into an array for reading
@@ -1681,9 +1718,7 @@ unless ($gpt_header_inaccessible>0) {
     $gpt_partitions{$i}{first_lba}=$first_lba;
     $gpt_partitions{$i}{final_lba}=$final_lba;
     $gpt_partitions{$i}{attr}=$attr;
-    # Strip null bytes from the name
-    $name=~tr/\0//d;
-    $gpt_partitions{$i}{name}=$name;
+    $gpt_partitions{$i}{name}=gpt_name_decode($name);
    }
    $i_decoded=$i_decoded+1;
   #} else { # length equals expected
@@ -1729,7 +1764,7 @@ unless ($gpt_header_inaccessible>0) {
    # Print the partition number and information
    my $sectors=$final_lba - $first_lba + 1;
    my $size = int (($sectors * $geometry{block_size})/(1024*1024));
-   print "GPT Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
+   print "GPT partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
    # Get the short nick from the guid, and likewise for the textual description
    print " Nick: $nick, Text: $guid_to_text{$type_guid}, Name: $name, GUID: $part_guid\n";
    if ($attr>0) {
@@ -1754,18 +1789,18 @@ unless ($gpt_header_backup_inaccessible==0) {
 # Must take into account the partition size to get to where it start:
 # - by default 128 partitions, 128 bytes each: so 16k before LBA-2
 # - but should use the numbers just read from the backup table if possible
-my $backuptable_size_guess;
+my $gptpartst_backup_size_guess;
 if (defined($gptheader_backup{num_parts}) and defined($gptheader_backup{part_size})) {
  # actual numbers
- $backuptable_size_guess=$gptheader_backup{num_parts}*$gptheader_backup{part_size};
+ $gptpartst_backup_size_guess=$gptheader_backup{num_parts}*$gptheader_backup{part_size};
 } elsif (defined($gptheader_main{num_parts}) and defined($gptheader_main{part_size})) {
  print "WARNING: GPT backup partition table size estimated from main\n";
  # estimate from main
- $backuptable_size_guess=$gptheader_main{num_parts}*$gptheader_main{part_size};
+ $gptpartst_backup_size_guess=$gptheader_main{num_parts}*$gptheader_main{part_size};
 } else {
  # guess for real
  print "WARNING: GPT backup partition table size guesstimated to 128^2\n";
- $backuptable_size_guess=128**2;
+ $gptpartst_backup_size_guess=128**2;
 }
 
 # Here, we may have problems reading the backup gpt table when:
@@ -1785,11 +1820,11 @@ if (defined($gptheader_backup{num_parts}) and defined($gptheader_backup{part_siz
 if ($gpt_header_backup_inaccessible > 0) {
  # Can at least try to explain the geometry requirements:
  # LBA0=MBR, LBA1=GPT header, LBA-1= GPT header backup
- my $minsize=($geometry{block_size}*3)+$backuptable_size_guess+$table_size_guess;
+ my $minsize=($geometry{block_size}*3)+$gptpartst_backup_size_guess+$gptpartst_size_guess;
  my $minsizek=$minsize/1024;
  my $sizek=$geometry{end}/1024;
  print "WARNING: no room for a GPT partition table backup: total size >= $minsize B:\n";
- print " even with no actual disk data at all, 3x $geometry{block_size} +$backuptable_size_guess+$table_size_guess is the minimum size\n";
+ print " even with no actual disk data at all, 3x $geometry{block_size} +$gptpartst_backup_size_guess+$gptpartst_size_guess is the minimum size\n";
  print " but here, $path is $geometry{end} B <= $minsize B: $sizek K < $minsizek K\n";
  # Just indicate that sitation to avoid reading at a random location
  $gpt_partst_backup_inaccessible=1;
@@ -1823,7 +1858,7 @@ if ($gpt_header_backup_inaccessible > 0) {
  #}
 
  # See if can reach this position using a negative number with WHENCE 2 (EOF)
- seek $fh, -1*($backuptable_size_guess)-(1*$geometry{block_size}), 2 or $gpt_partst_backup_inaccessible=3;
+ seek $fh, -1*($gptpartst_backup_size_guess)-(1*$geometry{block_size}), 2 or $gpt_partst_backup_inaccessible=3;
 
  # If there's a chance the read may work, try it to check the offset we land at
  if ($gpt_partst_backup_inaccessible>0) {
@@ -1836,9 +1871,9 @@ if ($gpt_header_backup_inaccessible > 0) {
   my $gptbackup_lba_offset=int($gptbackup_offset/$geometry{block_size});
   # Check if the position matches our expectations
   if ($gptheader_backup{gptparts_lba} == $gptbackup_lba_offset) {
-   print "BACKUP GPT AT (valid offset for LBA -2 -tblsize) -> $gptbackup_offset): $gptheader_backup{gptparts_lba}\n";
+   print "BACKUP GPT AT (valid offset for LBA -2 -tblsize) -> LBA=$gptbackup_offset): $gptheader_backup{gptparts_lba}\n";
   } else {
-   print "BACKUP GPT AT (WARNING: UNEXPECTED AT $gptbackup_offset SINCE LBA-2 -> $gptbackup_lba_offset): $gptheader_backup{gptparts_lba}\n";
+   print "BACKUP GPT AT (WARNING: UNEXPECTED AT $gptbackup_offset SINCE LBA-2 -> LBA=$gptbackup_lba_offset): $gptheader_backup{gptparts_lba}\n";
    # No need for a rewrite: could be a sign of having had >128 parts in the past
    #$gptheader_backup_write_needed=1
    # Just store that possible discrepency in the hash
@@ -1855,7 +1890,7 @@ if ($gpt_header_backup_inaccessible > 0) {
 
  # But only if there's no error
  if ($gpt_partst_backup_inaccessible==0) {
-  read $fh, $backup_gptparts, $backuptable_size_guess or $gpt_partst_backup_inaccessible=5;
+  read $fh, $backup_gptparts, $gptpartst_backup_size_guess or $gpt_partst_backup_inaccessible=5;
  } else {
   print "WARNING: failed reaching GPT backup partition table: $gpt_partst_backup_inaccessible\n";
   # Replace what should have been read by null bytes regardless why not available
@@ -1915,9 +1950,7 @@ if ($gpt_header_backup_inaccessible > 0) {
    $gpt_backup_partitions{$j}{first_lba}=$first_lba;
    $gpt_backup_partitions{$j}{final_lba}=$final_lba;
    $gpt_backup_partitions{$j}{attr}=$attr;
-   # Strip null bytes from the name
-   $name=~tr/\0//d;
-   $gpt_backup_partitions{$j}{name}=$name;
+   $gpt_backup_partitions{$j}{name}=gpt_name_decode($name);
   }
   $j=$j+1;
  } # for @partitions_raw_gpt_backup
@@ -1983,7 +2016,7 @@ if ($gpt_header_backup_inaccessible > 0) {
    my $size = int (($sectors * $geometry{block_size})/(1024*1024));
    # But print only if therere's a divergence
    if ($divergent>0) {
-    print "DIVERGENCE: BACKUP GPT Partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
+    print "DIVERGENCE: BACKUP GPT partition #$c: Start $first_lba, Stops: $final_lba, Sectors: $sectors, Size: $size M\n";
     # Will need a rewrite
     print "\tUPDATE NEEDED: GPT header backup (divergence)\n";
     $gptheader_backup_write_needed=1;
@@ -2011,6 +2044,8 @@ if ($gpt_header_backup_inaccessible > 0) {
 
 print "\n# TWEAKS\n";
 
+# FIXME: try to use nicks everywhere to explain better
+
 if (1) {
  # Part 1 starting at 64, even if type 0 could be an issue?
  # if type 0 and contains iso records
@@ -2022,7 +2057,7 @@ if (1) {
   if ($mbr_partitions{0}{isosigs}>2) {
    if ($mbr_partitions{0}{nick}=="0000") {
     # Check the GPT part start match, then sync both to start at 0
-    if ($gpt_partitions{0}{start} == $mbr_partitions{0}{start} and $mbr_partitions{0}{start} != 0) {
+    if ($gpt_partitions{0}{first_lba} == $mbr_partitions{0}{start} and $mbr_partitions{0}{start} != 0) {
      $mbr_partitions{0}{start}=0;
      # should be bad, but if created by xorriso, should work: nested
      $gpt_partitions{0}{start}=0;
@@ -2034,7 +2069,7 @@ if (1) {
  }
 
  # Mark partition 2 active if EFISP, make sure it's ef00
- if ($mbr_partitions{1}{type} eq "ef00") {
+ if ($mbr_partitions{1}{type}==0xef) {
   $mbr_partitions{1}{status}=0x80;
   if ($gpt_partitions{1}{first_lba} == $mbr_partitions{1}{start} and $gpt_partitions{1}{nick} ne "ef00") {
    $gpt_partitions{1}{nick}="ef00";
@@ -2053,8 +2088,8 @@ if (1) {
 
  # More complicated last example:
  # - a) create a partition 4 if there's no 4 but a 3 of type not 0x07: align and grow
- if ($mbr_partitions{2}{type}!=0x07 and $mbr_partitions{2}{type}!=0x83 and $mbr_partitions{2}{sectors}>0 and $mbr_partitions{3}{type}==0 and $mbr_partitions{3}{status}!=0x80) {
-  my $newpart_first_lba=$mbr_partitions{2}{start}+1;
+ if ($mbr_partitions{2}{type}!=0x07 and $mbr_partitions{2}{type}!=0x83 and $mbr_partitions{2}{final_lba}>0 and $mbr_partitions{3}{type}==0 and $mbr_partitions{3}{status}!=0x80) {
+  my $newpart_first_lba=$mbr_partitions{2}{final_lba}+1;
   # 4a1: align
   # FIXME: make the alignment fancier than modulo 8 which only does 4kn align
   # would help explain how to use $geometry{block_size}
@@ -2084,8 +2119,8 @@ if (1) {
     my $newpart_size=$newpart_lba*$geometry{block_size};
     my $newpart_sizeG=sprintf "%.2f", $newpart_size/(1024***3);
     print "Creating a 4th partition of $newpart_lba LBA (~ $newpart_sizeG G) from $newpart_first_lba to $newpart_final_lba\n";
-    $mbr_partitions{3}{start}=$newpart_first_lba;
-    $mbr_partitions{3}{size}=$newpart_lba;
+    $mbr_partitions{3}{first_lba}=$newpart_first_lba;
+    $mbr_partitions{3}{final_lba}=$newpart_final_lba;
     $mbr_partitions{3}{nick}="0700";
     $gpt_partitions{3}{first_lba}=$newpart_first_lba;
     $gpt_partitions{3}{final_lba}=$newpart_first_lba;
@@ -2116,6 +2151,9 @@ if (1) {
 # implies adding functions to parse the partition records and maybe headers too
 
 print "\n# UPDATES \n";
+
+# FIXME: remove the use of $fh: now closed asap so they stand out
+# goal: calculate offsets beforehad, during the tweaks
 
 ## Redo the MBR
 my $mbr_tweaked;
@@ -2212,17 +2250,17 @@ for my $r ( sort { $a <=> $b } keys %gpt_partitions) {
 my $gptparts_redone_crc32 = crc32($gptparts_redone);
 # WARNING: $gptparts_crc32own is already crc32($gptparts) but not sprintf'ed
 if ($gptheader_main{gptparts_crc32own} eq $gptparts_redone_crc32) {
- printf "GPT Partitions CRC32 (no update needed): %08x\n", $gptparts_redone_crc32;
+ printf "GPT partst CRC32 (no update needed): %08x\n", $gptparts_redone_crc32;
 } else {
  # this implies changing their crc32, therefore snowballs to the header
- printf "GPT Partitions CRC32 change: implies writing GPT main and backup header too\n";
+ printf "GPT partst CRC32 change: implies writing GPT main and backup header too\n";
  print "\tUPDATE NEEDED: GPT header and partition table main and backup (crc32 change)\n";
  $gptpartst_write_needed=1;
  $gptheader_write_needed=1;
  # Can't be certain the backup needs change too, but good rule of thumb
  $gptpartst_backup_write_needed=1;
  $gptheader_backup_write_needed=1;
- printf "GPT Partitions CRC32: (update from %08x to:) %08x\n", $gptheader_main{gptparts_crc32own}, $gptparts_redone_crc32;
+ printf "GPT partst CRC32: (update from %08x to:) %08x\n", $gptheader_main{gptparts_crc32own}, $gptparts_redone_crc32;
  # byte-by-byte comparisons can help eyeball the differences
  #compare_two_strings($gpt_partitions{raw}, $gptparts_redone);
  # TODO: could create a comparison using the hashes instead, or store $gpt_partitions{raw}
@@ -2230,8 +2268,6 @@ if ($gptheader_main{gptparts_crc32own} eq $gptparts_redone_crc32) {
  $gptheader_main{gptparts_crc32own}=$gptparts_redone_crc32;
 } # if match redone
 
-# Use a negative number to go in the other direction, from the end
-open my $fh, "<:raw", $path or die "Can't open $path: $!\n";
 ## 2/4 then the main header (usually 1/4)
 # and if we don't have the right address for the backup, fix that right now
 # like if couldn't access it, or if at different address than expected
@@ -2240,12 +2276,14 @@ if ($gpt_header_backup_inaccessible>0 or defined($gptheader_main{other_lba_unexp
  print "\tUPDATE NEEDED: GPT header and backup (that was inaccessible)\n";
  $gptheader_write_needed=1;
  $gptheader_backup_write_needed=1;
- seek $fh, $backuptable_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=2;
+ # Use a negative number to go in the other direction, from the end
+ seek $fh, $gptpartst_backup_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=2;
  # If can't access it, use $gptheader_main{current_lba} everywehre
  if ($gpt_header_backup_inaccessible>1) {
   $gptheader_backup{current_lba}=$gptheader_main{current_lba};
   $gptheader_main{other_lba}=$gptheader_main{current_lba};
  }
+ # FIXME: separate the address computation
  # Get the offset
  my $gptbackup_offset = tell $fh;
  # Get the lba
@@ -2272,7 +2310,7 @@ my $gptheader_redone_crc32=crc32($gptheader_redone_forcrc32);
 
 # And put this $gptheader_redone_crc32 inside instead of the null bytes
 # WARNING: use H32 for gpt_guid_encode(), a16 without
-my $gptheader_redone= pack ("a8 L L L L Q Q Q Q H32 Q L L L", $gptheader_main{signature},
+my $gptheader_redone_withcrc32= pack ("a8 L L L L Q Q Q Q H32 Q L L L", $gptheader_main{signature},
  $gptheader_main{revision}, $gptheader_main{header_size}, $gptheader_redone_crc32, $gptheader_main{reserved},
  $gptheader_main{current_lba}, $gptheader_main{other_lba}, $gptheader_main{first_lba}, $gptheader_main{final_lba}, gpt_guid_encode($gptheader_main{disk_guid}),
  $gptheader_main{gptparts_lba}, $gptheader_main{num_parts}, $gptheader_main{part_size}, $gptparts_redone_crc32);
@@ -2376,7 +2414,7 @@ if ($gptheader_backup{header_crc32own} eq $backup_gptparts_redone_crc32 and $bac
 # - if backup_gptparts_lba and the others are good?
 # - or is some recomputing needed?
 #
-# We still have $backuptable_size_guess, but need to find the end:
+# We still have $gptpartst_backup_size_guess, but need to find the end:
 # Should *end* at LBA -2, meaning must take into account the partition size
 # by default 128 partitions, 128 bytes each: so 16k before LBA-2
 # could do as before, but the result should still be available:
@@ -2385,7 +2423,7 @@ if ($gptheader_backup{header_crc32own} eq $backup_gptparts_redone_crc32 and $bac
 ## $gptheader_write_needed=1;
 ## $gptheader_backup_write_needed=1
 ## # Use a negative number to go in the other direction, from the end
-## seek $fh, $backuptable_size_guess-1*$geometry{block_size}, 2 or $gptheader_backup_problem=2;
+## seek $fh, $gptpartst_backup_size_guess-1*$geometry{block_size}, 2 or $gptheader_backup_problem=2;
 ## # This time, the same error as before is fatal.
 ## if ($gptheader_backup_problem >1) {
 ##  die "ERROR: Can't seek to backup GPT ending at LBA-2: $!\n";
@@ -2405,10 +2443,10 @@ if ($gptheader_backup{header_crc32own} eq $backup_gptparts_redone_crc32 and $bac
 
 
 ## Use a negative number to go in the other direction, from the end
-##seek $fh, $backuptable_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=2;
+##seek $fh, $gptpartst_backup_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=2;
 # use the address that main now wants
 # FIXME: $gptheader_main{other_lba}*$geometry{block_size};
-seek $fh, $backuptable_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=3;
+seek $fh, $gptpartst_backup_size_guess-1*$geometry{block_size}, 2 or $gpt_header_backup_inaccessible=3;
 if ($gpt_header_backup_inaccessible>2) {
  die "ERROR: Can't seek to backup GPT normally ending at LBA-2 now at LBA $gptheader_main{other_lba}: $!\n";
 }
@@ -2425,7 +2463,7 @@ my $gptbackup_offset = tell $fh;
 # Then stuff that lba into the header
 my $gptbackup_lba_offset=int($gptbackup_offset/$geometry{block_size});
 
-# We're now done with the reading
+# We're now really done with the reading
 close $fh or die "Can't close $path : $!\n";
 
 # Can use this $gptbackup_lba_offset instead of $other_lba to prep for crc
@@ -2486,16 +2524,16 @@ my $gptbackup_header_redone_withcrc32 = pack ("a8 L L L L Q Q Q Q a16 Q L L L",
 
 ########################################################### WRITE TWEAKS
 # reopen the path to the block device or disk image file
-open $fh, "+<:raw", $path or die "Can't open for read/write $path : $!\n";
+open my $fhw, "+<:raw", $path or die "Can't open for read/write $path : $!\n";
 
 ## Write the new MBR
 if ($mbr_write_needed>0)  {
  unless ($mbr_write_denial>0) {
   print "# WRITING NEW MBR:\n";
   # Return to the MBR offset
-  seek $fh, 446, 0 or die "Can't seek back to the MBR: $!\n";
+  seek $fhw, 446, 0 or die "Can't seek back to the MBR: $!\n";
   # Then can just write the boot code back to the MBR
-  print $fh $mbr_tweaked or die "Can't write tweaked MBR: $!";
+  print $fhw $mbr_tweaked or die "Can't write tweaked MBR: $!";
  } else {
   print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE MBR:\n";
   my $mbr_tweaked_text=unpack "H64", $mbr_tweaked;
@@ -2507,39 +2545,76 @@ if ($mbr_write_needed>0)  {
 
 ## Write the new GPT as needed
 # 1/4 start with backup header
-if ($gptheader_write_needed>0 or $gptheader_backup_write_needed>0) {
- # FIXME: change the refuse variable name to matc
- unless ($gptheader_backup_write_needed>0 or $gptpartst_backup_write_needed=1) {
+if ($gptheader_backup_write_needed>0) {
+ # FIXME: change the refuse variable name to match
+ unless ($gptheader_backup_write_denial>0) {
   unless (length($gptbackup_header_redone_withcrc32) != $hardcoded_gpt_header_size) {
-   seek $fh, $gptbackup_lba_offset, 0 or die "Can't seek back to the GPT BACKUP HEADER: $!\n";
-   print $fh $gptbackup_header_redone_crc32 or die "Can't write tweaked GPT BACKUP HEADER: $!";
- } else { # unless length
-  my $gptbackup_header_redone_withcrc32_text=unpack "H64", $mbr_tweaked;
+   # could use $gptheader_backup{current_lba} or $gptheader_main{other_lba}
+   seek $fhw, $gptheader_backup{current_lba}, 0 or die "Can't seek back to the GPT BACKUP HEADER: $!\n";
+   print $fhw $gptbackup_header_redone_withcrc32 or die "Can't write tweaked GPT BACKUP HEADER: $!";
+  } else { # unless length
+  print "PROBLEM: SIZE CHANGE FROM " . $hardcoded_gpt_header_size . " TO " . length($gptbackup_header_redone_withcrc32) . "\n";
+  } # unless length
+ } else { # unless needed 
+  my $gptbackup_header_redone_withcrc32_text=unpack "H$hardcoded_gpt_header_size", $gptbackup_header_redone_withcrc32;
   print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE GPT BACKUP HEADER:\n";
   print "$gptbackup_header_redone_withcrc32_text\n";
  } # unless refuse
- } else { # else needed
-  print "# NO NEED TO WRITE THE GPT BACKUP\n";
- } # needed
-}
+} else { # else needed
+ print "# NO NEED TO WRITE THE GPT BACKUP\n";
+} # needed
 
 # 2/4 then the main header
 if ($gptheader_write_needed>0) {
- unless ($gptheader_write_denial>0 or $gptpartst_write_denial=1) {
-  unless (length($gptbackup_header_redone_withcrc32) != $hardcoded_gpt_header_size) {
-   seek $fh, $gptheader_main{current_lba}, 0 or die "Can't seek back to the GPT HEADER at $gptheader_main{current_lba}: $!\n";
-   print $fh $gptheader_redone_forcrc32 or die "Can't write tweaked GPT HEADER: $!";
+ unless ($gptheader_write_denial>0) {
+  unless (length($gptheader_redone_withcrc32) != $hardcoded_gpt_header_size) {
+   seek $fhw, $gptheader_main{current_lba}, 0 or die "Can't seek back to the GPT HEADER at $gptheader_main{current_lba}: $!\n";
+   print $fhw $gptheader_redone_withcrc32 or die "Can't write tweaked GPT HEADER: $!";
  } else { # unless length
-  my $gptbackup_header_redone_withcrc32_text=unpack "H64", $mbr_tweaked;
-  print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE GPT BACKUP HEADER:\n";
-  print "$gptbackup_header_redone_withcrc32_text\n";
+  print "PROBLEM: SIZE CHANGE FROM " . $hardcoded_gpt_header_size . " TO " . length($gptheader_redone_withcrc32) . "\n";
+ } # unless length
+} else { # unless needed
+  my $gpt_header_redone_withcrc32_text=unpack "H$hardcoded_gpt_header_size", $gptheader_redone_withcrc32;
+  print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE GPT HEADER:\n";
+  print "$gpt_header_redone_withcrc32_text\n";
  } # unless refuse
- } else { # else needed
+} else { # else needed
   print "# NO NEED TO WRITE THE GPT MAIN\n";
- } # needed
-}
+} # needed
 
-## FIXME: do 3/4 4/4 the partst and the partst backup
+# 3/3 the gpt partst 
+if ($gptpartst_write_needed>0) {
+ unless ($gptpartst_write_denial>0) {
+  unless (length($gptparts_redone) != $gptpartst_size_guess ) {
+   seek $fhw, $gptheader_main{gptparts_lba}, 0 or die "Can't seek back to the GPT partitions at $gptheader_main{gptparts_lba}: $!\n";
+   print $fhw $gptparts_redone or die "Can't write tweaked GPT partitions: $!";
+  } else { # unless length
+   print "PROBLEM: SIZE CHANGE FROM $gptpartst_size_guess TO " . length($gptparts_redone) . "\n";
+  } # unless length
+ } else { # unless refuse
+  print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE GPT PARTST\n";
+  # TODO: show partition-by-partition, for the defined ones, otherwise too long
+ } # unless refuse
+} else { # else needed
+  print "# NO NEED TO WRITE THE GPT PARTST\n";
+} # if $gptpartst_write_needed
+
+# 4/4 the gpt partst backup
+if ($gptpartst_backup_write_needed>0) {
+ unless ($gptheader_backup_write_denial>0) {
+  unless (length($backup_gptparts_redone) != $gptpartst_backup_size_guess ) {
+   seek $fhw, $gptheader_backup{gptparts_lba}, 0 or die "Can't seek back to the GPT partitions backup at $gptheader_backup{gptparts_lba}: $!\n";
+   print $fhw $backup_gptparts_redone or die "Can't write tweaked GPT partst backup: $!";
+  } else { # unless length
+   print "PROBLEM: SIZE CHANGE FROM $gptpartst_size_guess TO " . length($gptparts_redone) . "\n";
+  } # unless length
+ } else { # unless refuse
+  print "PROBLEM: WAS REFUSED, BUT SHOULD WRITE GPT PARTST BACKUP\n";
+  # TODO: show partition-by-partition, for the defined ones, otherwise too long
+ } # unless refuse
+} else { # else needed
+  print "# NO NEED TO WRITE THE GPT PARTST BACKUP\n";
+} # if $gptpartst_backup_write_needed
 
 # Close the path to the block device as we're done then
-close $fh or die "Can't close $path : $!\n";
+close $fhw or die "Can't close $path : $!\n";
